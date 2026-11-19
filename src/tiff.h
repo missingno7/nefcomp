@@ -53,6 +53,12 @@ struct NefLayout {
 
 // check_strip=false accepts a "skeleton" (file truncated at the raw strip).
 NefLayout parse_nef(const Buf &b, bool check_strip = true);
+
+// NEF compression code: makernote 0x0051 byte 10 (Z cameras), else tag 0x0093
+// (older bodies). 1/4 lossy, 2/10 uncompressed, 3 lossless, 13 HE, 14 HE*; 0 = unknown.
+unsigned nef_compression_code(const Buf &b, const NefLayout &L);
+// Set it (in 0x0051 and/or 0x0093, whichever exist). Returns false if neither exists.
+bool set_nef_compression_code(Buf &b, const NefLayout &L, unsigned code);
 std::string read_file(const std::string &path, std::vector<uint8_t> &out);
 void write_file(const std::string &path, const std::vector<uint8_t> &data);
 

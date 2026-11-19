@@ -18,6 +18,8 @@
 //   5 6-bit packed CFA image (Z 6 helper image), lossless JPEG XL of its planes
 //   6 JPEG preview kept: lossless JPEG recompression (bit-exact)
 //   7 lossy-NEF curve (code -> 14-bit value) used for the raw data, uint16 LE, brotli
+//   8 raw border pixels cropped off in the DNG: a=x, b=y, w/h = crop size; payload =
+//     4 x (u32 length + lossless JPEG XL) for the top, bottom, left and right areas
 
 #include "nef_embed.h"
 #include "nef_convert.h"
@@ -39,7 +41,7 @@ namespace nefcomp {
 namespace {
 
 constexpr char kMagic[12] = {'N', 'E', 'F', 'C', 'O', 'M', 'P', '-', 'S', 'K', 'E', 'L'};
-enum Kind : uint8_t { kJpegRegen = 1, kRgbRegen = 2, kMakernote = 3, kPack12 = 4, kPack6 = 5, kJpegKept = 6, kLossyCurve = 7 };
+enum Kind : uint8_t { kJpegRegen = 1, kRgbRegen = 2, kMakernote = 3, kPack12 = 4, kPack6 = 5, kJpegKept = 6, kLossyCurve = 7, kRawMargins = 8 };
 
 struct Record {
     uint8_t kind = 0;
@@ -204,7 +206,7 @@ std::vector<uint8_t> dng_private_makernote(const std::vector<uint8_t> &pd) {
 
 std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vector<uint16_t> &px,
                                  const std::vector<uint8_t> &dng_mn, bool keep_previews, EmbedStats *st,
-                                 const std::vector<uint16_t> *lossy_curve) {
+                                 const std::vector<uint16_t> *lossy_curve, const RawCrop *crop) {
     EmbedStats s;
     Buf b;
     b.d = nef;
@@ -295,6 +297,31 @@ std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vec
         }
     }
 
+    if (crop) {
+        const unsigned NW = L.width, NH = L.height;
+        Record r;
+        r.kind = kRawMargins;
+        r.w = crop->w; r.h = crop->h; r.a = crop->x; r.b = crop->y;
+        struct Rect { unsigned x, y, w, h; };
+        const Rect rects[4] = {{0, 0, NW, crop->y},
+                               {0, crop->y + crop->h, NW, NH - crop->y - crop->h},
+                               {0, crop->y, crop->x, crop->h},
+                               {crop->x + crop->w, crop->y, NW - crop->x - crop->w, crop->h}};
+        for (const Rect &q : rects) {
+            std::vector<uint8_t> enc;
+            if (q.w && q.h) {
+                std::vector<uint16_t> area(size_t(q.w) * q.h);
+                for (unsigned y = 0; y < q.h; y++) std::copy_n(&px[size_t(q.y + y) * NW + q.x], q.w, &area[size_t(y) * q.w]);
+                enc = jxl_encode_gray16(area.data(), q.w, q.h, 0, true, 9);
+                std::vector<uint16_t> back;
+                if (!jxl_decode_gray16(enc.data(), enc.size(), q.w, q.h, back) || back != area)
+                    throw std::runtime_error("internal: raw border round trip failed");
+            }
+            for (int i = 0; i < 4; i++) r.payload.push_back(uint8_t(enc.size() >> (8 * i)));
+            r.payload.insert(r.payload.end(), enc.begin(), enc.end());
+        }
+        recs.push_back(std::move(r));
+    }
     if (lossy_curve && !lossy_curve->empty()) {
         Record r;
         r.kind = kLossyCurve;
@@ -326,16 +353,17 @@ std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vec
     return std::move(w.v);
 }
 
-std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::vector<uint16_t> &px,
-                                   const std::vector<uint8_t> &dng_mn, const RenderParams &rp, EmbedRestore *info,
+std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::vector<uint16_t> &px_dng,
+                                   const std::vector<uint8_t> &dng_mn, const RenderParams &rp_dng, EmbedRestore *info,
                                    bool to_lossless) {
+    std::vector<uint16_t> px = px_dng;   // becomes the full NEF raw
+    RenderParams rp = rp_dng;
     EmbedRestore ri;
     Reader rd{blob.data(), blob.data() + blob.size()};
     if (std::memcmp(rd.take(12), kMagic, 12) != 0) throw std::runtime_error("unknown embedded NEF format");
     uint32_t ver = rd.u32();
     ri.original_size = rd.u64();
     const uint8_t *fh = rd.take(32), *ph = rd.take(32);
-    ri.pixels_exact = std::memcmp(sha_px(px).data(), ph, 32) == 0;
     std::vector<uint8_t> skel;
     std::vector<uint16_t> lossy_curve;
     if (ver == 1) {
@@ -361,6 +389,36 @@ std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::
                 lossy_curve.resize(r.w);
                 for (size_t i = 0; i < r.w; i++) lossy_curve[i] = uint16_t(raw[2 * i] | raw[2 * i + 1] << 8);
             }
+        }
+        // raw border pixels cropped off in the DNG
+        for (auto &r : recs) {
+            if (r.kind != kRawMargins) continue;
+            NefRaw nr = describe_raw(skel, false);
+            const unsigned NW = nr.width, NH = nr.height;
+            if (px_dng.size() != size_t(r.w) * r.h || r.a + r.w > NW || r.b + r.h > NH)
+                throw std::runtime_error("raw border record does not match the DNG");
+            px.assign(size_t(NW) * NH, 0);
+            for (unsigned y = 0; y < r.h; y++)
+                std::copy_n(&px_dng[size_t(y) * r.w], r.w, &px[size_t(y + r.b) * NW + r.a]);
+            struct Rect { unsigned x, y, w, h; };
+            const Rect rects[4] = {{0, 0, NW, r.b}, {0, r.b + r.h, NW, NH - r.b - r.h}, {0, r.b, r.a, r.h},
+                                   {r.a + r.w, r.b, NW - r.a - r.w, r.h}};
+            size_t at = 0;
+            for (const Rect &q : rects) {
+                if (at + 4 > r.payload.size()) throw std::runtime_error("corrupt raw border record");
+                uint32_t len = uint32_t(r.payload[at]) | uint32_t(r.payload[at + 1]) << 8 |
+                               uint32_t(r.payload[at + 2]) << 16 | uint32_t(r.payload[at + 3]) << 24;
+                at += 4;
+                if (at + len > r.payload.size()) throw std::runtime_error("corrupt raw border record");
+                if (q.w && q.h) {
+                    std::vector<uint16_t> area;
+                    if (!jxl_decode_gray16(&r.payload[at], len, q.w, q.h, area)) throw std::runtime_error("raw border decode failed");
+                    for (unsigned y = 0; y < q.h; y++) std::copy_n(&area[size_t(y) * q.w], q.w, &px[size_t(q.y + y) * NW + q.x]);
+                }
+                at += len;
+            }
+            if (rp.crop_w) { rp.crop_x += r.a; rp.crop_y += r.b; }
+            else { rp.crop_x = r.a; rp.crop_y = r.b; rp.crop_w = r.w; rp.crop_h = r.h; }
         }
         // data records first (makernote, helper images, kept previews), previews last
         for (auto &r : recs) {
@@ -412,11 +470,12 @@ std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::
     case RawFormat::HEStar: ri.original_format = "High Efficiency*"; break;
     default: ri.original_format = "unknown";
     }
-    if (to_lossless && describe_raw(skel, false).format != RawFormat::Lossless) {
-        skel = skeleton_to_lossless(skel);
+    if (to_lossless && describe_raw(skel, false).format != RawFormat::Lossless && describe_raw(skel, false).bps == 14) {
+        skel = skeleton_to_lossless(skel);   // 12-bit originals keep their own format
         lossy_curve.clear();
         ri.converted_to_lossless = true;
     }
+    ri.pixels_exact = std::memcmp(sha_px(px).data(), ph, 32) == 0;
     std::vector<uint8_t> nef = nef_assemble(skel, px, lossy_curve.empty() ? nullptr : &lossy_curve);
     ri.file_exact = std::memcmp(sha256(nef.data(), nef.size()).data(), fh, 32) == 0;
     if (info) *info = ri;

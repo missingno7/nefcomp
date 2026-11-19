@@ -20,17 +20,18 @@ NefRaw describe_raw(const std::vector<uint8_t> &file, bool check_strip) {
     r.strip_off = L.strip_off; r.strip_len = L.strip_len;
     unsigned code = 0;
     if (L.have_makernote) {
-        if (auto *e = L.makernote.find(0x51); e && e->size() > 10) code = b.d[e->value_pos + 10];
+        code = nef_compression_code(b, L);
         if (auto *e = L.makernote.find(0x3d); e && e->count >= 1) r.black = b.uint_val(L.makernote, *e, 0);
     }
-    if (L.compression != 34713 || L.bps != 14) return r;
+    if (L.compression != 34713 || (L.bps != 14 && L.bps != 12)) return r;
     if (code == 13) r.format = RawFormat::HE;
     else if (code == 14) r.format = RawFormat::HEStar;
     else if (code == 3 && L.makernote.find(0x96)) r.format = RawFormat::Lossless;
     else if ((code == 1 || code == 4) && L.makernote.find(0x96) && L.makernote.find(0x96)->size() > 2 &&
              b.d[L.makernote.find(0x96)->value_pos] == 0x44)
         r.format = RawFormat::Lossy;
-    else if (L.strip_len == nikon_packed14_stride(L.width) * L.height) r.format = RawFormat::Packed14;
+    else if (L.bps == 14 && L.strip_len == nikon_packed14_stride(L.width) * L.height) r.format = RawFormat::Packed14;
+    if (L.bps != 14 && (r.format == RawFormat::HE || r.format == RawFormat::HEStar)) r.format = RawFormat::Unsupported;
     return r;
 }
 

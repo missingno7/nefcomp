@@ -124,6 +124,25 @@ for a predictable size. `--effort 9` measured 3 % smaller but 0.4 dB worse and 1
 the default 7 is fine. `--keep-previews` costs 0.8 MB (Z 6) to 3.5 MB (Z 8) and makes
 exact restores possible; `-m lossless --keep-previews` restores byte-identical NEFs.
 
+### Tested cameras and formats
+
+| camera | formats tested | notes |
+| --- | --- | --- |
+| Nikon Z 8 (FW 3.10, 4.06) | lossless, HE★, HE (FX and DX) | HE NEF output; DNG; HE★ → HE |
+| Nikon Z 6 (FW 3.50) | lossless, lossy, uncompressed | DNG only (no HE in camera) |
+| Nikon D7000 (FW 1.05) | lossless (big-endian file, 2010) | DNG; Adobe crops 44 masked columns |
+
+What makes this general:
+* **Compression code:** read from makernote 0x0051 (Z bodies) or 0x0093 (older bodies).
+* **Lossless encoder:** reproduces Z 8, Z 6 and D7000 files byte-for-byte, so Nikon's encoder hasn't changed in 15 years.
+* **Adobe crop:** when Adobe crops the raw, nefcomp finds the crop by exact matching. The DNG stores Adobe's
+  region, the cropped-off border goes losslessly into the embedded data, and `restore` puts it back.
+* **Black level:** the companding curve uses Adobe's black level (0 on the D7000, 1008 on Z bodies).
+
+Not supported: 12-bit lossless/lossy files are decoded, but untested and restored only in their own format.
+"Split" lossy streams (some older bodies), 12-bit packed uncompressed and small-size NEFs are skipped
+with a reason.
+
 ## Build
 
 MSYS2 MinGW-w64 g++: `mingw32-make` produces one static `nefcomp.exe`.

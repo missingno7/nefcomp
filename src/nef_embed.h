@@ -10,6 +10,9 @@
 
 namespace nefcomp {
 
+// Region of the NEF raw that the DNG stores (Adobe may crop masked borders).
+struct RawCrop { unsigned x = 0, y = 0, w = 0, h = 0; };
+
 struct EmbedStats {
     size_t skeleton = 0;          // bytes of the NEF before the raw strip
     size_t blob = 0;              // bytes stored in the DNG
@@ -24,7 +27,7 @@ struct EmbedStats {
 // lossy_curve: for lossy NEFs, the code -> value curve that produced `px`.
 std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vector<uint16_t> &px,
                                  const std::vector<uint8_t> &dng_makernote, bool keep_previews, EmbedStats *st,
-                                 const std::vector<uint16_t> *lossy_curve = nullptr);
+                                 const std::vector<uint16_t> *lossy_curve = nullptr, const RawCrop *crop = nullptr);
 
 struct EmbedRestore {
     bool pixels_exact = false, file_exact = false;

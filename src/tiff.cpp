@@ -111,6 +111,21 @@ NefLayout parse_nef(const Buf &b, bool check_strip) {
     return L;
 }
 
+unsigned nef_compression_code(const Buf &b, const NefLayout &L) {
+    if (!L.have_makernote) return 0;
+    if (auto *e = L.makernote.find(0x51); e && e->size() > 10) return b.d[e->value_pos + 10];
+    if (auto *e = L.makernote.find(0x93); e && e->count >= 1 && e->type == 3) return b.uint_val(L.makernote, *e);
+    return 0;
+}
+
+bool set_nef_compression_code(Buf &b, const NefLayout &L, unsigned code) {
+    bool done = false;
+    if (!L.have_makernote) return false;
+    if (auto *e = L.makernote.find(0x51); e && e->size() > 10) { b.d[e->value_pos + 10] = uint8_t(code); done = true; }
+    if (auto *e = L.makernote.find(0x93); e && e->count >= 1 && e->type == 3) { b.w16(e->value_pos, uint16_t(code), L.makernote.le); done = true; }
+    return done;
+}
+
 std::string read_file(const std::string &path, std::vector<uint8_t> &out) {
     FILE *f = std::fopen(path.c_str(), "rb");
     if (!f) return "cannot open " + path;

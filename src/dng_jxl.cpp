@@ -341,9 +341,8 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     if (!e.empty()) throw std::runtime_error(e);
     NefRaw info;
     std::vector<uint16_t> px = decode_raw(nef, &info);
-    const unsigned W = info.width, H = info.height;
-    if ((W | H) & 1) throw std::runtime_error("odd raw dimensions");
-    res.width = W; res.height = H;
+    unsigned W = info.width, H = info.height;  // become the DNG raw size below
+    const unsigned NW = W, NH = H;             // full NEF raw size
 
     // 1. Adobe DNG Converter -> uncompressed base DNG (metadata/profile source)
     std::string exe = o.dng_converter.empty() ? default_dng_converter() : o.dng_converter;
@@ -365,41 +364,68 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     TNode &raw = *find_raw(chain, t);
     TNode &ifd0 = chain[0];
     auto iv = [&](uint16_t tag) { return t.ints(raw.tags.at(tag)).at(0); };
-    if (iv(0x100) != W || iv(0x101) != H || iv(0x103) != 1 || iv(0x102) != 16 || iv(0x106) != 32803)
+    const unsigned DW = iv(0x100), DH = iv(0x101);
+    if (iv(0x103) != 1 || iv(0x102) != 16 || iv(0x106) != 32803 || DW > NW || DH > NH)
         throw std::runtime_error("unexpected raw layout in Adobe's DNG");
-    // Adobe's raw samples must equal nefcomp's decode. For lossy NEFs Adobe
-    // keeps the raw codes plus its curve (LinearizationTable); we take the
-    // linear values from Adobe's curve, so the DNG shows exactly what Camera
-    // Raw shows for the original NEF, and keep that curve for `restore`.
+    // Adobe's raw samples must equal nefcomp's decode. Adobe may crop masked
+    // border columns/rows: the crop offset is found by exact matching and the
+    // cropped-off pixels are kept losslessly in the embedded NEF data. For
+    // lossy NEFs Adobe keeps the raw codes plus its curve (LinearizationTable);
+    // we take the linear values from Adobe's curve, so the DNG shows exactly
+    // what Camera Raw shows for the original NEF, and keep that curve.
     std::vector<uint16_t> lossy_curve;
+    unsigned cx = 0, cy = 0;
     {
         std::vector<uint8_t> data;
         for (auto &blk : raw.blocks.at(0x111)) data.insert(data.end(), blk.begin(), blk.end());
-        if (data.size() < size_t(W) * H * 2) throw std::runtime_error("short raw data in Adobe's DNG");
+        if (data.size() < size_t(DW) * DH * 2) throw std::runtime_error("short raw data in Adobe's DNG");
         auto sample = [&](size_t i) {
             return le ? uint16_t(data[2 * i] | data[2 * i + 1] << 8) : uint16_t(data[2 * i] << 8 | data[2 * i + 1]);
         };
+        std::vector<uint16_t> ref = px;  // what Adobe stores: linear values, or raw codes for lossy NEFs
         if (info.format == RawFormat::Lossy) {
-            std::vector<uint16_t> codes, nikon_curve;
-            decode_raw_codes(nef, codes, nikon_curve);
+            std::vector<uint16_t> nikon_curve, adobe_lut;
+            decode_raw_codes(nef, ref, nikon_curve);
             if (!raw.tags.count(0xc618)) throw std::runtime_error("Adobe's DNG of a lossy NEF has no linearization table");
-            std::vector<uint16_t> adobe;
-            for (uint32_t v : t.ints(raw.tags[0xc618])) adobe.push_back(uint16_t(v));
-            if (adobe.size() < nikon_curve.size()) throw std::runtime_error("Adobe's linearization table is too short");
-            for (size_t i = 0; i < px.size(); i++) {
-                if (sample(i) != codes[i]) throw std::runtime_error("Adobe's raw codes differ from nefcomp's decode");
-                px[i] = std::min<uint16_t>(adobe[codes[i]], 16383);
-            }
-            lossy_curve.assign(adobe.begin(), adobe.begin() + nikon_curve.size());
+            for (uint32_t v : t.ints(raw.tags[0xc618])) adobe_lut.push_back(uint16_t(v));
+            if (adobe_lut.size() < nikon_curve.size()) throw std::runtime_error("Adobe's linearization table is too short");
+            for (size_t i = 0; i < px.size(); i++) px[i] = std::min<uint16_t>(adobe_lut[ref[i]], 16383);
+            lossy_curve.assign(adobe_lut.begin(), adobe_lut.begin() + nikon_curve.size());
             for (auto &v : lossy_curve) v = std::min<uint16_t>(v, 16383);
-        } else {
-            for (size_t i = 0; i < px.size(); i++)
-                if (sample(i) != px[i]) throw std::runtime_error("Adobe's raw data differs from nefcomp's decode");
         }
+        auto matches = [&](unsigned x0, unsigned y0, unsigned rows) {
+            for (unsigned y = 0; y < rows; y++)
+                for (unsigned x = 0; x < DW; x++)
+                    if (sample(size_t(y) * DW + x) != ref[size_t(y + y0) * NW + x + x0]) return false;
+            return true;
+        };
+        bool found = false;
+        for (unsigned y0 = 0; y0 <= NH - DH && !found; y0++)
+            for (unsigned x0 = 0; x0 <= NW - DW && !found; x0++)
+                if (matches(x0, y0, std::min(DH, 8u)) && matches(x0, y0, DH)) { cx = x0; cy = y0; found = true; }
+        if (!found) throw std::runtime_error("Adobe's raw data differs from nefcomp's decode");
+    }
+    std::vector<uint16_t> px_full = px;
+    if (DW != NW || DH != NH) {  // the DNG holds the cropped region
+        std::vector<uint16_t> crop(size_t(DW) * DH);
+        for (unsigned y = 0; y < DH; y++)
+            std::copy_n(&px_full[size_t(y + cy) * NW + cx], DW, &crop[size_t(y) * DW]);
+        px = std::move(crop);
+    }
+    W = DW; H = DH;
+    if ((W | H) & 1) throw std::runtime_error("odd raw dimensions");
+    res.width = W; res.height = H;
+
+    // black level for the companding curve: Adobe's (e.g. 0 for older bodies)
+    unsigned black = info.black ? info.black : 1008;
+    if (raw.tags.count(0xc61a)) {
+        auto v = t.reals(raw.tags[0xc61a]);
+        double sum = 0;
+        for (double x : v) sum += x;
+        if (!v.empty()) black = unsigned(std::lround(sum / v.size()));
     }
 
     // 2. companding + Bayer plane interleave
-    const unsigned black = info.black ? info.black : 1008;
     auto tr = he_transfer(black);
     auto inv = he_inverse(tr);
     const unsigned h2 = H / 2, w2 = W / 2;
@@ -504,7 +530,9 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     // 5. the rest of the NEF
     std::vector<uint8_t> mn = ifd0.tags.count(0xc634) ? dng_private_makernote(ifd0.tags[0xc634].data) : std::vector<uint8_t>{};
     EmbedStats es;
-    auto blob = embed_build(nef, px, mn, o.keep_previews, &es, lossy_curve.empty() ? nullptr : &lossy_curve);
+    RawCrop crop{cx, cy, W, H};
+    auto blob = embed_build(nef, px_full, mn, o.keep_previews, &es, lossy_curve.empty() ? nullptr : &lossy_curve,
+                            (W != NW || H != NH) ? &crop : nullptr);
     res.skeleton_bytes = blob.size();
     res.previews_dropped = es.previews_dropped;
     res.previews_kept_bytes = es.previews_kept;

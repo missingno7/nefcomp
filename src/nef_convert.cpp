@@ -145,8 +145,7 @@ NefInfo inspect_nef(const std::vector<uint8_t> &file, bool check_strip) {
     info.width = L.width; info.height = L.height; info.bps = L.bps;
     info.strip_off = L.strip_off; info.strip_len = L.strip_len; info.file_size = file.size();
     if (L.have_makernote) {
-        if (auto *e = L.makernote.find(0x51); e && e->size() > 10) {
-            info.compression_code = b.d[e->value_pos + 10];
+        if ((info.compression_code = nef_compression_code(b, L)) != 0) {
             switch (info.compression_code) {
             case 3: info.compression = NefCompression::Lossless; break;
             case 13: info.compression = NefCompression::HE; break;
@@ -306,10 +305,9 @@ std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skel_in) {
     b.d = skel_in;
     NefLayout L = parse_nef(b, false);
     if (!L.have_makernote) throw std::runtime_error("makernote missing; cannot convert to lossless");
-    if (L.bps != 14 || L.compression != 34713) throw std::runtime_error("only 14-bit Nikon raw can be converted to lossless");
-    auto *e51 = L.makernote.find(0x51);
-    if (!e51 || e51->size() < 11) throw std::runtime_error("makernote tag 0x51 missing");
-    const unsigned code = b.d[e51->value_pos + 10];
+    if (L.bps != 14 || L.compression != 34713)  // the lossless table is verified for 14-bit files
+        throw std::runtime_error("only 14-bit Nikon raw can be converted to lossless");
+    const unsigned code = nef_compression_code(b, L);
     if (code == 3) return skel_in;
     const bool mle = L.makernote.le;
     std::vector<uint8_t> tail;  // blocks appended after the old skeleton end
@@ -321,7 +319,7 @@ std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skel_in) {
     };
 
     // 1. makernote: compression code, size field, lossless table
-    b.d[e51->value_pos + 10] = 3;
+    if (!set_nef_compression_code(b, L, 3)) throw std::runtime_error("NEF compression tag missing");
     if (auto *e58 = L.makernote.find(0x58); e58 && e58->size() == 12) std::memset(&b.d[e58->value_pos + 4], 0, 8);
     if (auto *e96 = L.makernote.find(0x96); e96 && e96->size() >= sizeof kLossless96) {
         std::memcpy(&b.d[e96->value_pos], kLossless96, sizeof kLossless96);   // lossy table slot is larger

@@ -80,6 +80,8 @@ static void write_atomic(const fs::path &out, const std::vector<uint8_t> &data) 
     if (ec) { fs::remove(out); fs::rename(tmp, out); }
 }
 
+static std::string nef_format_name(unsigned code);
+
 static int cmd_info(const std::vector<std::string> &files) {
     int rc = 0;
     for (auto &f : files) {
@@ -90,7 +92,8 @@ static int cmd_info(const std::vector<std::string> &files) {
             NefInfo i = inspect_nef(d);
             printf("%s: %s %s (%s), %ux%u %u-bit, %s (code %u), black %u, raw %.1f MB of %.1f MB\n", f.c_str(),
                    i.make.c_str(), i.model.c_str(), i.firmware.c_str(), i.width, i.height, i.bps,
-                   compression_name(i.compression), i.compression_code, i.black, i.strip_len / 1e6, i.file_size / 1e6);
+                   i.compression_code ? nef_format_name(i.compression_code).c_str() : compression_name(i.compression),
+                   i.compression_code, i.black, i.strip_len / 1e6, i.file_size / 1e6);
         } catch (const std::exception &ex) {
             fprintf(stderr, "%s: %s\n", f.c_str(), ex.what());
             rc = 1;
