@@ -44,7 +44,7 @@ jobs:
         with: { name: linux-x64, path: dist/*.tar.gz }
 
   macos:
-    runs-on: macos-14
+    runs-on: macos-latest  # Apple silicon; binaries target macOS 11+ (deployment target below)
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
