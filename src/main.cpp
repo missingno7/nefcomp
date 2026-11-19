@@ -8,6 +8,12 @@
 #include "nef_rebuild.h"
 #include "tiff.h"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -69,7 +75,7 @@ struct Options {
 };
 
 static std::string lower_ext(const fs::path &p) {
-    std::string e = p.extension().string();
+    std::string e = p.extension().u8string();
     for (auto &c : e) c = char(std::tolower(static_cast<unsigned char>(c)));
     return e;
 }
@@ -80,35 +86,55 @@ static bool raw_input_ext(const fs::path &p) {
 }
 
 // Extension for a restored raw: ".NRW" when the DNG's OriginalRawFileName says
-// the camera wrote an NRW (Coolpix), else ".NEF". Reads only the file start.
+// the camera wrote an NRW (Coolpix), else ".NEF". Reads only the header, IFD0
+// and that tag (they can lie anywhere in the file).
 static std::string restored_ext(const fs::path &dng) {
-    std::vector<uint8_t> d(1 << 20);
     FILE *f = _wfopen(dng.wstring().c_str(), L"rb");
     if (!f) return ".NEF";
-    d.resize(fread(d.data(), 1, d.size(), f));
-    fclose(f);
-    try {
-        Buf b;
-        b.d = std::move(d);
-        if (b.d.size() < 8 || (b.d[0] != 'I' && b.d[0] != 'M')) return ".NEF";
-        bool le = b.d[0] == 'I';
-        Ifd i0 = b.read_ifd(b.u32(4, le), 0, le);
-        if (auto *e = i0.find(0xc68b); e && e->value_pos + e->size() <= b.d.size()) {
-            std::string n(b.d.begin() + e->value_pos, b.d.begin() + e->value_pos + e->size());
-            n = n.c_str();
-            if (lower_ext(fs::path(n)) == ".nrw") return ".NRW";
+    std::string ext = ".NEF";
+    auto rd = [&](uint64_t at, size_t n, std::vector<uint8_t> &v) {
+        v.resize(n);
+        return _fseeki64(f, int64_t(at), SEEK_SET) == 0 && fread(v.data(), 1, n, f) == n;
+    };
+    std::vector<uint8_t> h, cnt, ents, val;
+    if (rd(0, 8, h) && (h[0] == 'I' || h[0] == 'M')) {
+        const bool le = h[0] == 'I';
+        auto u16 = [&](const uint8_t *p) { return le ? unsigned(p[0] | p[1] << 8) : unsigned(p[0] << 8 | p[1]); };
+        auto u32 = [&](const uint8_t *p) {
+            return le ? uint32_t(p[0] | p[1] << 8 | p[2] << 16 | uint32_t(p[3]) << 24)
+                      : uint32_t(uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]);
+        };
+        const uint32_t ifd0 = u32(&h[4]);
+        if (rd(ifd0, 2, cnt) && rd(ifd0 + 2, size_t(u16(cnt.data())) * 12, ents)) {
+            for (size_t i = 0; i + 12 <= ents.size(); i += 12) {
+                const uint8_t *e = &ents[i];
+                const unsigned type = u16(e + 2);
+                const uint32_t count = u32(e + 4);
+                if (u16(e) != 0xc68b || (type != 1 && type != 2) || count == 0 || count > 4096) continue;
+                std::string n;
+                if (count <= 4) n.assign(reinterpret_cast<const char *>(e + 8), count);
+                else if (rd(u32(e + 8), count, val)) n.assign(val.begin(), val.end());
+                n = n.c_str();
+                // byte-wise check: the name's encoding does not matter
+                if (n.size() >= 4) {
+                    std::string tail = n.substr(n.size() - 4);
+                    for (auto &c : tail) c = char(std::tolower(uint8_t(c)));
+                    if (tail == ".nrw") ext = ".NRW";
+                }
+                break;
+            }
         }
-    } catch (const std::exception &) {
     }
-    return ".NEF";
+    fclose(f);
+    return ext;
 }
 
 static void write_atomic(const fs::path &out, const std::vector<uint8_t> &data) {
-    std::string tmp = out.string() + ".part";
+    std::string tmp = out.u8string() + ".part";
     write_file(tmp, data);
     std::error_code ec;
-    fs::rename(tmp, out, ec);
-    if (ec) { fs::remove(out); fs::rename(tmp, out); }
+    fs::rename(fs::u8path(tmp), out, ec);
+    if (ec) { fs::remove(out); fs::rename(fs::u8path(tmp), out); }
 }
 
 static std::string nef_format_name(unsigned code);
@@ -136,13 +162,13 @@ static int cmd_info(const std::vector<std::string> &files) {
 static size_t convert_he(const fs::path &in, const fs::path &out, const Options &o) {
     auto t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> d;
-    auto e = read_file(in.string(), d);
+    auto e = read_file(in.u8string(), d);
     if (!e.empty()) throw std::runtime_error(e);
     HeEncodeOptions opt;
     opt.mode = o.mode;
     opt.threads = o.threads;
     ConvertResult r = convert_lossless_to_he(d, opt, o.allow_untested);
-    for (auto &w : r.warnings) printf("  warning: %s: %s\n", in.string().c_str(), w.c_str());
+    for (auto &w : r.warnings) printf("  warning: %s: %s\n", in.u8string().c_str(), w.c_str());
     std::string verify_msg;
     if (o.verify) {
         Buf b;
@@ -166,7 +192,7 @@ static size_t convert_he(const fs::path &in, const fs::path &out, const Options 
     }
     write_atomic(out, r.output);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    printf("  HE   %s -> %s: %.1f MB -> %.1f MB (%s)%s [%.1fs]\n", in.string().c_str(), out.string().c_str(),
+    printf("  HE   %s -> %s: %.1f MB -> %.1f MB (%s)%s [%.1fs]\n", in.u8string().c_str(), out.u8string().c_str(),
            d.size() / 1e6, r.output.size() / 1e6, o.mode == HeMode::HE ? "HE" : "HE*", verify_msg.c_str(), secs);
     return r.output.size();
 }
@@ -184,13 +210,13 @@ static size_t convert_dng(const fs::path &in, const fs::path &out, const Options
     opt.keep_previews = o.keep_previews;
     opt.threads = o.threads;
     opt.dng_converter = o.dng_converter;
-    DngResult r = nef_to_jxl_dng(in.string(), opt);
+    DngResult r = nef_to_jxl_dng(in.u8string(), opt);
     if (r.dng.size() >= fs::file_size(in)) {
         char why[200];
         snprintf(why, sizeof why, "DNG would not be smaller (%.1f MB -> %.1f MB); lower -q / --bpp, or --force",
                  double(fs::file_size(in)) / 1e6, r.dng.size() / 1e6);
         if (!o.force) throw SkipError(why);
-        printf("  warning: %s: %s\n", in.string().c_str(), why);
+        printf("  warning: %s: %s\n", in.u8string().c_str(), why);
     }
     write_atomic(out, r.dng);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -203,7 +229,7 @@ static size_t convert_dng(const fs::path &in, const fs::path &out, const Options
         else snprintf(v, sizeof v, ", verify: PSNR %.2f dB, rms %.2f, max %d", r.psnr, r.rms, r.max_err);
     }
     printf("  DNG  %s -> %s: %.1f MB -> %.1f MB (JPEG XL %s; raw %.1f MB + NEF data %.2f MB, previews %s)%s [%.1fs]\n",
-           in.string().c_str(), out.string().c_str(), double(fs::file_size(in)) / 1e6, r.dng.size() / 1e6, qs,
+           in.u8string().c_str(), out.u8string().c_str(), double(fs::file_size(in)) / 1e6, r.dng.size() / 1e6, qs,
            r.jxl_bytes / 1e6, r.skeleton_bytes / 1e6, o.keep_previews ? "kept" : "regenerated on restore", v, secs);
     return r.dng.size();
 }
@@ -211,7 +237,7 @@ static size_t convert_dng(const fs::path &in, const fs::path &out, const Options
 static size_t restore_one(const fs::path &in, const fs::path &out, const Options &o) {
     auto t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> d;
-    auto e = read_file(in.string(), d);
+    auto e = read_file(in.u8string(), d);
     if (!e.empty()) throw std::runtime_error(e);
     RestoreResult r = jxl_dng_to_nef(d, o.threads, o.restore_original);
     write_atomic(out, r.nef);
@@ -225,7 +251,7 @@ static size_t restore_one(const fs::path &in, const fs::path &out, const Options
         what += r.pixels_exact ? ", raw identical to the original" : ", raw as compressed in the DNG";
         if (r.previews_regenerated) what += ", previews regenerated";
     }
-    printf("  NEF  %s -> %s: %.1f MB (original %s %.1f MB): %s [%.1fs]\n", in.string().c_str(), out.string().c_str(),
+    printf("  NEF  %s -> %s: %.1f MB (original %s %.1f MB): %s [%.1fs]\n", in.u8string().c_str(), out.u8string().c_str(),
            r.nef.size() / 1e6, r.original_name.c_str(), r.original_size / 1e6, what.c_str(), secs);
     return r.nef.size();
 }
@@ -273,7 +299,7 @@ static void plan_nef(Job &j, const Options &o) {
             raw = describe_raw(pre, false);
         } catch (const std::exception &) {
             std::vector<uint8_t> full;
-            auto e = read_file(j.in.string(), full);
+            auto e = read_file(j.in.u8string(), full);
             if (!e.empty()) throw std::runtime_error(e);
             info = inspect_nef(full);
             raw = describe_raw(full);
@@ -325,14 +351,15 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
     std::vector<Job> jobs;
     bool any_dir = false;
     const bool out_given = !o.output.empty();
+    const fs::path out_path = fs::u8path(o.output);
     for (auto &in : inputs) {
-        fs::path p(in);
+        fs::path p = fs::u8path(in);
         std::error_code ec;
         if (fs::is_directory(p, ec)) {
             any_dir = true;
             auto add = [&](const fs::directory_entry &de) {
                 if (!de.is_regular_file() || (restore ? lower_ext(de.path()) != in_ext : !raw_input_ext(de.path()))) return;
-                if (out_given && fs::is_directory(o.output) && under(de.path(), o.output)) return;  // our outputs
+                if (out_given && fs::is_directory(out_path) && under(de.path(), out_path)) return;  // our outputs
                 jobs.push_back({fs::path(de.path()).lexically_normal().make_preferred(), fs::path(p).lexically_normal().make_preferred(), {}, Act::Skip, ""});
             };
             if (o.recursive)
@@ -348,9 +375,9 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
     }
     if (jobs.empty()) { fprintf(stderr, "no %s files found%s\n", restore ? ".dng" : ".NEF/.NRW", o.recursive ? "" : " (use -r for subfolders)"); return 2; }
     std::sort(jobs.begin(), jobs.end(), [](const Job &a, const Job &b) { return a.in < b.in; });
-    const bool out_is_dir = out_given && (jobs.size() > 1 || any_dir || fs::is_directory(o.output) ||
+    const bool out_is_dir = out_given && (jobs.size() > 1 || any_dir || fs::is_directory(out_path) ||
                                           o.output.back() == '\\' || o.output.back() == '/' ||
-                                          fs::path(o.output).extension().empty());  // no extension = folder
+                                          out_path.extension().empty());  // no extension = folder
 
     // 2. plan
     for (auto &j : jobs) {
@@ -359,16 +386,16 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
         if (j.act == Act::Skip) continue;
         std::string suffix = o.suffix_set ? o.suffix
                              : j.act == Act::HE ? (o.mode == HeMode::HE ? "_HE" : "_HEs") : "";
-        std::string ext = j.act == Act::HE ? j.in.extension().string() : j.act == Act::DNG ? ".dng" : restored_ext(j.in);
-        fs::path name = j.in.stem().string() + suffix + ext;
+        std::string ext = j.act == Act::HE ? j.in.extension().u8string() : j.act == Act::DNG ? ".dng" : restored_ext(j.in);
+        fs::path name = fs::u8path(j.in.stem().u8string() + suffix + ext);
         if (!out_given) j.out = j.in.parent_path() / name;
         else if (out_is_dir) {
             std::error_code ec;
             fs::path rel = fs::relative(j.in.parent_path(), j.root, ec);
             if (ec || rel.empty() || *rel.begin() == "..") rel = ".";
-            j.out = (fs::path(o.output) / rel / name).lexically_normal().make_preferred();
-        } else j.out = fs::path(o.output).make_preferred();
-        if (fs::exists(j.out) && !o.overwrite) { j.act = Act::Skip; j.why = "output exists: " + j.out.string() + " (--overwrite)"; }
+            j.out = (out_path / rel / name).lexically_normal().make_preferred();
+        } else j.out = fs::path(out_path).make_preferred();
+        if (fs::exists(j.out) && !o.overwrite) { j.act = Act::Skip; j.why = "output exists: " + j.out.u8string() + " (--overwrite)"; }
     }
     unsigned n_he = 0, n_dng = 0, n_res = 0, n_skip = 0;
     for (auto &j : jobs) (j.act == Act::HE ? n_he : j.act == Act::DNG ? n_dng : j.act == Act::Restore ? n_res : n_skip)++;
@@ -398,7 +425,7 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
     };
     for (auto &j : jobs) {
         if (j.act == Act::Skip) {
-            printf("  skip %s: %s\n", j.in.string().c_str(), j.why.c_str());
+            printf("  skip %s: %s\n", j.in.u8string().c_str(), j.why.c_str());
             skipped++;
             tally(j.why);
             fflush(stdout);
@@ -414,18 +441,18 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
             bytes_in += in_size;
             bytes_out += out_size;
         } catch (const SkipError &ex) {
-            printf("  skip %s: %s\n", j.in.string().c_str(), ex.what());
+            printf("  skip %s: %s\n", j.in.u8string().c_str(), ex.what());
             skipped++;
             tally(ex.what());
         } catch (const std::exception &ex) {
             std::string msg = ex.what();
             if (restore && msg.find("no embedded NEF") != std::string::npos) {
-                printf("  skip %s: not a nefcomp DNG (no embedded NEF)\n", j.in.string().c_str());
+                printf("  skip %s: not a nefcomp DNG (no embedded NEF)\n", j.in.u8string().c_str());
                 skipped++;
                 tally("not a nefcomp DNG");
             } else {
                 fflush(stdout);
-                fprintf(stderr, "  FAIL %s: %s\n", j.in.string().c_str(), msg.c_str());
+                fprintf(stderr, "  FAIL %s: %s\n", j.in.u8string().c_str(), msg.c_str());
                 fflush(stderr);
                 failed++;
             }
@@ -443,8 +470,17 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
     return failed ? 1 : 0;
 }
 
-int main(int argc, char **argv) {
-    std::vector<std::string> args(argv + 1, argv + argc);
+int main() {
+    // Windows hands narrow argv over in the ANSI code page, which loses names
+    // like "Fotky čeština": take the UTF-16 command line and keep UTF-8.
+    std::vector<std::string> args;
+    {
+        int argc = 0;
+        wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        for (int i = 1; wargv && i < argc; i++) args.push_back(fs::path(wargv[i]).u8string());
+        if (wargv) LocalFree(wargv);
+    }
+    SetConsoleOutputCP(CP_UTF8);
     if (args.empty() || args[0] == "-h" || args[0] == "--help") { fputs(kUsage, stdout); return args.empty() ? 2 : 0; }
     if (args[0] == "info") return cmd_info({args.begin() + 1, args.end()});
     if (args[0] == "decode" || args[0] == "skeleton" || args[0] == "assemble") {

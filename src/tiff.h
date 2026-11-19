@@ -60,6 +60,7 @@ NefLayout parse_nef(const Buf &b, bool check_strip = true);
 unsigned nef_compression_code(const Buf &b, const NefLayout &L);
 // Set it (in 0x0051 and/or 0x0093, whichever exist). Returns false if neither exists.
 bool set_nef_compression_code(Buf &b, const NefLayout &L, unsigned code);
+// Paths are UTF-8 (nefcomp keeps every path as UTF-8 internally).
 std::string read_file(const std::string &path, std::vector<uint8_t> &out);
 void write_file(const std::string &path, const std::vector<uint8_t> &data);
 

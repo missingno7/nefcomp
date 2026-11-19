@@ -359,9 +359,9 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     fs::path tmp = fs::path(tmpw) / (L"nefcomp_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(seq++));
     fs::create_directories(tmp);
     struct Cleanup { fs::path p; ~Cleanup() { std::error_code ec; fs::remove_all(p, ec); } } cleanup{tmp};
-    run_dng_converter(exe, nef_path, tmp, "base.dng");
+    run_dng_converter(exe, fs::u8path(nef_path), tmp, "base.dng");  // UTF-8 -> path
     Buf b;
-    e = read_file((tmp / "base.dng").string(), b.d);
+    e = read_file((tmp / "base.dng").u8string(), b.d);
     if (!e.empty()) throw std::runtime_error("Adobe DNG Converter did not produce a DNG (unsupported camera?)");
 
     bool le = b.d.size() > 2 && b.d[0] == 'I';

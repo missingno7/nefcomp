@@ -20,12 +20,9 @@ DNGC = r'C:\Program Files\Adobe\Adobe DNG Converter\Adobe DNG Converter.exe'
 
 
 
-def restored(stem):
-    """restore writes .NEF, or .NRW for Coolpix originals"""
-    for ext in ('.NEF', '.NRW'):
-        if os.path.exists(stem + ext):
-            return stem + ext
-    return stem + '.NEF'
+def restored(stem, original):
+    """restore must write .NRW for Coolpix NRW originals, else .NEF"""
+    return stem + ('.NRW' if original.lower().endswith('.nrw') else '.NEF')
 
 def run(*args):
     p = subprocess.run([NEFCOMP, *args], capture_output=True, text=True)
@@ -90,7 +87,7 @@ def main():
         ex = os.path.join(d, name + '_exact.dng')
         if rc == 0 and os.path.exists(ex):
             rc, m = run('restore', '--as', 'original', '--overwrite', '-o', os.path.join(d, 'orig'), ex)
-            rf = restored(os.path.join(d, 'orig', name + '_exact'))
+            rf = restored(os.path.join(d, 'orig', name + '_exact'), f)
             r['exact'] = 'byte-identical' if rc == 0 and os.path.exists(rf) and sha(rf) == sha(f) else (
                 'raw identical (HE re-encoded)' if rc == 0 and 'raw identical' in m and 'High Efficiency' in m else 'FAIL: ' + m[-80:])
         else:
@@ -98,7 +95,7 @@ def main():
         # 4. default lossless restore of the q70 DNG
         if os.path.exists(dng):
             rc, m = run('restore', '--overwrite', '-o', os.path.join(d, 'll'), dng)
-            rl = restored(os.path.join(d, 'll', name))
+            rl = restored(os.path.join(d, 'll', name), f)
             if rc == 0 and os.path.exists(rl):
                 a, b = os.path.join(d, 'a.u16'), os.path.join(d, 'b.u16')
                 run('decode', dng, a)
