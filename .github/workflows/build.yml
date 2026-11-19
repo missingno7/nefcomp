@@ -26,7 +26,9 @@ jobs:
           echo "VERSION=$v" >> "$GITHUB_ENV"
       - run: sudo apt-get update && sudo apt-get install -y ninja-build
       - uses: actions/cache@v4
-        with: { path: .deps, key: linux-deps-v1-${{ hashFiles('third_party/build_libjxl.sh', 'third_party/build_libjpeg.sh') }} }
+        with:
+          path: .deps
+          key: linux-deps-v1-${{ hashFiles('third_party/build_libjxl.sh', 'third_party/build_libjpeg.sh') }}
       - name: dependencies (libjxl, libjpeg-turbo)
         run: |
           [ -f .deps/jxl/lib/libjxl.a ] || CC=gcc CXX=g++ sh third_party/build_libjxl.sh "$PWD/.work/jxl" "$PWD/.deps/jxl"
@@ -52,7 +54,9 @@ jobs:
           echo "VERSION=$v" >> "$GITHUB_ENV"
       - run: brew install ninja nasm
       - uses: actions/cache@v4
-        with: { path: .deps, key: macos-deps-v1-${{ hashFiles('third_party/build_libjxl.sh', 'third_party/build_libjpeg.sh') }} }
+        with:
+          path: .deps
+          key: macos-deps-v1-${{ hashFiles('third_party/build_libjxl.sh', 'third_party/build_libjpeg.sh') }}
       - name: dependencies for arm64 and x86_64
         run: |
           for arch in arm64 x86_64; do
@@ -105,7 +109,9 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="$(git describe --tags --always)-ci"; fi
           echo "VERSION=$v" >> "$GITHUB_ENV"
       - uses: actions/cache@v4
-        with: { path: .deps, key: windows-deps-v1-${{ hashFiles('third_party/build_libjxl.sh', 'third_party/build_libjpeg.sh') }} }
+        with:
+          path: .deps
+          key: windows-deps-v1-${{ hashFiles('third_party/build_libjxl.sh', 'third_party/build_libjpeg.sh') }}
       - name: dependencies (libjxl, libjpeg-turbo)
         run: |
           [ -f .deps/jxl/lib/libjxl.a ] || CC=gcc CXX=g++ sh third_party/build_libjxl.sh "$PWD/.work/jxl" "$PWD/.deps/jxl"
