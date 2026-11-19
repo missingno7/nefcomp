@@ -20,10 +20,9 @@
 #include "jxl_util.h"
 #include "nef_embed.h"
 #include "nef_rebuild.h"
+#include "platform.h"
 #include "preview.h"
 #include "tiff.h"
-
-#include <windows.h>
 
 #include <algorithm>
 #include <atomic>
@@ -230,33 +229,10 @@ template <class F> void parallel_for(unsigned n, unsigned threads, F f) {
     if (!err.empty()) throw std::runtime_error(err);
 }
 
-std::wstring widen(const std::string &s) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring w(n ? n - 1 : 0, L'\0');
-    if (n) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
-    return w;
-}
-
-// Run Adobe DNG Converter: uncompressed DNG of `nef` into `outdir`.
+// Run Adobe DNG Converter: uncompressed DNG of `nef` into `outdir` (UTF-8 paths).
 void run_dng_converter(const std::string &exe, const fs::path &nef, const fs::path &outdir, const std::string &name) {
-    std::wstring cmd = L"\"" + widen(exe) + L"\" -u -d \"" + outdir.wstring() + L"\" -o \"" + widen(name) + L"\" \"" +
-                       fs::absolute(nef).wstring() + L"\"";
-    STARTUPINFOW si{};
-    si.cb = sizeof si;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
-    HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
-    si.hStdOutput = si.hStdError = nul;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-    BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    if (!ok) { CloseHandle(nul); throw std::runtime_error("cannot start Adobe DNG Converter (" + exe + ")"); }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(nul);
+    int rc = platform::run_quiet({exe, "-u", "-d", outdir.u8string(), "-o", name, fs::absolute(nef).u8string()});
+    if (rc < 0) throw std::runtime_error("cannot start Adobe DNG Converter (" + exe + ")");
 }
 
 // Colour/crop parameters for preview rendering, from the DNG's tags.
@@ -336,9 +312,7 @@ std::vector<uint16_t> jxl_dng_decode(const std::vector<uint8_t> &dng, unsigned &
     return decode_jxl_raw(t, *find_raw(chain, t), threads, W, H);
 }
 
-std::string default_dng_converter() {
-    return "C:\\Program Files\\Adobe\\Adobe DNG Converter\\Adobe DNG Converter.exe";
-}
+std::string default_dng_converter() { return platform::default_dng_converter(); }
 
 DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     DngResult res;
@@ -352,11 +326,13 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
 
     // 1. Adobe DNG Converter -> uncompressed base DNG (metadata/profile source)
     std::string exe = o.dng_converter.empty() ? default_dng_converter() : o.dng_converter;
-    if (!fs::exists(widen(exe))) throw std::runtime_error("Adobe DNG Converter not found at " + exe + " (use --dng-converter)");
-    wchar_t tmpw[MAX_PATH];
-    GetTempPathW(MAX_PATH, tmpw);
+    if (exe.empty())
+        throw std::runtime_error("--dng needs Adobe DNG Converter, which exists for Windows and macOS only "
+                                 "(restore, info and HE conversion work everywhere)");
+    if (!fs::exists(fs::u8path(exe))) throw std::runtime_error("Adobe DNG Converter not found at " + exe + " (use --dng-converter)");
     static std::atomic<unsigned> seq{0};
-    fs::path tmp = fs::path(tmpw) / (L"nefcomp_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(seq++));
+    fs::path tmp = platform::temp_dir() /
+                   ("nefcomp_" + std::to_string(platform::process_id()) + "_" + std::to_string(seq++));
     fs::create_directories(tmp);
     struct Cleanup { fs::path p; ~Cleanup() { std::error_code ec; fs::remove_all(p, ec); } } cleanup{tmp};
     run_dng_converter(exe, fs::u8path(nef_path), tmp, "base.dng");  // UTF-8 -> path

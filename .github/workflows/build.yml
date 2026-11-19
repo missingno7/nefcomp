@@ -1,0 +1,145 @@
+name: build
+
+# Builds nefcomp for Windows, Linux and macOS, runs a smoke test on each, and
+# uploads the packages. Pushing a tag v* also creates a DRAFT GitHub release
+# with the packages and SHA256SUMS (publish it by hand after checking).
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DEPS_KEY: deps-v1-${{ hashFiles('third_party/build_libjxl.sh', 'third_party/build_libjpeg.sh') }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="$(git describe --tags --always)-ci"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - uses: actions/cache@v4
+        with: { path: .deps, key: linux-${{ env.DEPS_KEY }} }
+      - name: dependencies (libjxl, libjpeg-turbo)
+        run: |
+          [ -f .deps/jxl/lib/libjxl.a ] || CC=gcc CXX=g++ sh third_party/build_libjxl.sh "$PWD/.work/jxl" "$PWD/.deps/jxl"
+          [ -f .deps/jpeg/lib/libjpeg.a ] || CC=gcc sh third_party/build_libjpeg.sh "$PWD/.work/jpeg" "$PWD/.deps/jpeg"
+      - name: build
+        run: |
+          make JXL="$PWD/.deps/jxl" JPEG_LIB="$PWD/.deps/jpeg/lib/libjpeg.a" JPEG_CFLAGS="-I$PWD/.deps/jpeg/include" VERSION="$VERSION" -j4
+          strip nefcomp
+          file nefcomp
+      - run: sh tools/ci_smoke.sh ./nefcomp smoke
+      - run: sh tools/package_release.sh nefcomp linux-x64 "$VERSION" dist
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-x64, path: dist/*.tar.gz }
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="$(git describe --tags --always)-ci"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - run: brew install ninja nasm
+      - uses: actions/cache@v4
+        with: { path: .deps, key: macos-${{ env.DEPS_KEY }} }
+      - name: dependencies for arm64 and x86_64
+        run: |
+          for arch in arm64 x86_64; do
+            export CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$arch -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0" BUILD_DIR="build-$arch"
+            [ -f ".deps/jxl-$arch/lib/libjxl.a" ] || CC=clang CXX=clang++ sh third_party/build_libjxl.sh "$PWD/.work/jxl" "$PWD/.deps/jxl-$arch"
+            [ -f ".deps/jpeg-$arch/lib/libjpeg.a" ] || CC=clang sh third_party/build_libjpeg.sh "$PWD/.work/jpeg" "$PWD/.deps/jpeg-$arch"
+          done
+      - name: build universal binary
+        run: |
+          for arch in arm64 x86_64; do
+            make -B CXX="clang++ -arch $arch -mmacosx-version-min=11.0" JXL="$PWD/.deps/jxl-$arch" \
+              JPEG_LIB="$PWD/.deps/jpeg-$arch/lib/libjpeg.a" JPEG_CFLAGS="-I$PWD/.deps/jpeg-$arch/include" VERSION="$VERSION" -j4
+            mv nefcomp "nefcomp-$arch"
+          done
+          lipo -create -output nefcomp nefcomp-arm64 nefcomp-x86_64
+          strip nefcomp
+          lipo -info nefcomp
+          otool -L nefcomp
+      - run: sh tools/ci_smoke.sh ./nefcomp smoke
+      - name: smoke test (x86_64 slice under Rosetta)
+        run: |
+          softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            lipo nefcomp -thin x86_64 -output nefcomp-x86_64-only
+            sh tools/ci_smoke.sh ./nefcomp-x86_64-only smoke-x86
+          else
+            echo "Rosetta not available; x86_64 slice not run"
+          fi
+      - run: sh tools/package_release.sh nefcomp macos-universal "$VERSION" dist
+      - uses: actions/upload-artifact@v4
+        with: { name: macos-universal, path: dist/*.tar.gz }
+
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run: { shell: 'msys2 {0}' }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make zip
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-zlib
+      - name: version
+        run: |
+          git config --global --add safe.directory "$PWD"
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="$(git describe --tags --always)-ci"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with: { path: .deps, key: windows-${{ env.DEPS_KEY }} }
+      - name: dependencies (libjxl, libjpeg-turbo)
+        run: |
+          [ -f .deps/jxl/lib/libjxl.a ] || CC=gcc CXX=g++ sh third_party/build_libjxl.sh "$PWD/.work/jxl" "$PWD/.deps/jxl"
+          [ -f .deps/jpeg/lib/libjpeg.a ] || CC=gcc sh third_party/build_libjpeg.sh "$PWD/.work/jpeg" "$PWD/.deps/jpeg"
+      - name: build
+        run: |
+          make JXL="$PWD/.deps/jxl" JPEG_LIB="$PWD/.deps/jpeg/lib/libjpeg.a" JPEG_CFLAGS="-I$PWD/.deps/jpeg/include" VERSION="$VERSION" -j4
+          strip nefcomp.exe
+          ldd nefcomp.exe || true
+      - run: sh tools/ci_smoke.sh ./nefcomp.exe smoke
+      - run: sh tools/package_release.sh nefcomp.exe windows-x64 "$VERSION" dist
+      - uses: actions/upload-artifact@v4
+        with: { name: windows-x64, path: dist/*.zip }
+
+  release:
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: checksums
+        run: cd dist && sha256sum nefcomp-* > SHA256SUMS && cat SHA256SUMS
+      - name: draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          notes=RELEASE_NOTES.md
+          [ -f "$notes" ] || { echo "nefcomp ${GITHUB_REF_NAME}" > "$notes"; }
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+            --title "nefcomp ${GITHUB_REF_NAME#v}" --notes-file "$notes"

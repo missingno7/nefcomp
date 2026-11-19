@@ -22,3 +22,14 @@ __pycache__/
 *.jpg
 *.JPG
 *.png
+*.nrw
+*.NRW
+
+# Release / CI build directories
+/nefcomp
+/dist/
+/smoke/
+/.deps/
+/.work/
+/.libjxl-build/
+/.libjpeg-build/

@@ -6,13 +6,9 @@
 #include "he_decode.h"
 #include "nef_convert.h"
 #include "nef_rebuild.h"
+#include "platform.h"
 #include "tiff.h"
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <shellapi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -26,8 +22,12 @@
 using namespace nefcomp;
 namespace fs = std::filesystem;
 
+#ifndef NEFCOMP_VERSION
+#define NEFCOMP_VERSION "dev"
+#endif
+
 static const char *kUsage =
-    "nefcomp - shrink Nikon NEF raw files after shooting\n"
+    "nefcomp " NEFCOMP_VERSION " - shrink Nikon NEF raw files after shooting\n"
     "\n"
     "usage:\n"
     "  nefcomp [options] <file.NEF | directory> ...    lossless NEF -> HE / HE* NEF; HE* -> HE (-m he)\n"
@@ -38,6 +38,7 @@ static const char *kUsage =
     "                                                  from bodies without lossless keep their format);\n"
     "                                                  --as original = original NEF format\n"
     "  nefcomp info <file.NEF> ...\n"
+    "  nefcomp --version\n"
     "\n"
     "options:\n"
     "  -m, --mode MODE        hestar (default) | he | lossless (lossless: --dng only)\n"
@@ -89,12 +90,12 @@ static bool raw_input_ext(const fs::path &p) {
 // the camera wrote an NRW (Coolpix), else ".NEF". Reads only the header, IFD0
 // and that tag (they can lie anywhere in the file).
 static std::string restored_ext(const fs::path &dng) {
-    FILE *f = _wfopen(dng.wstring().c_str(), L"rb");
+    FILE *f = platform::open_file(dng, "rb");
     if (!f) return ".NEF";
     std::string ext = ".NEF";
     auto rd = [&](uint64_t at, size_t n, std::vector<uint8_t> &v) {
         v.resize(n);
-        return _fseeki64(f, int64_t(at), SEEK_SET) == 0 && fread(v.data(), 1, n, f) == n;
+        return platform::seek64(f, int64_t(at), SEEK_SET) == 0 && fread(v.data(), 1, n, f) == n;
     };
     std::vector<uint8_t> h, cnt, ents, val;
     if (rd(0, 8, h) && (h[0] == 'I' || h[0] == 'M')) {
@@ -266,7 +267,7 @@ struct Job {
 
 static std::vector<uint8_t> read_prefix(const fs::path &p, size_t n) {
     std::vector<uint8_t> v;
-    FILE *f = _wfopen(p.wstring().c_str(), L"rb");
+    FILE *f = platform::open_file(p, "rb");
     if (!f) throw std::runtime_error("cannot open file");
     v.resize(n);
     v.resize(fread(v.data(), 1, n, f));
@@ -407,7 +408,11 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
     }
     if (n_dng) {
         std::string exe = o.dng_converter.empty() ? default_dng_converter() : o.dng_converter;
-        if (!fs::exists(fs::u8path(exe))) {
+        if (exe.empty()) {
+            fprintf(stderr, "--dng needs Adobe DNG Converter, which exists for Windows and macOS only; "
+                            "DNG jobs cannot run here (restore, info and HE conversion work)\n");
+            for (auto &j : jobs) if (j.act == Act::DNG) { j.act = Act::Skip; j.why = "needs Adobe DNG Converter (Windows/macOS)"; }
+        } else if (!fs::exists(fs::u8path(exe))) {
             fprintf(stderr, "Adobe DNG Converter not found at %s (install it or use --dng-converter); DNG jobs cannot run\n", exe.c_str());
             for (auto &j : jobs) if (j.act == Act::DNG) { j.act = Act::Skip; j.why = "needs Adobe DNG Converter"; }
         }
@@ -470,18 +475,11 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
     return failed ? 1 : 0;
 }
 
-int main() {
-    // Windows hands narrow argv over in the ANSI code page, which loses names
-    // like "Fotky čeština": take the UTF-16 command line and keep UTF-8.
-    std::vector<std::string> args;
-    {
-        int argc = 0;
-        wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
-        for (int i = 1; wargv && i < argc; i++) args.push_back(fs::path(wargv[i]).u8string());
-        if (wargv) LocalFree(wargv);
-    }
-    SetConsoleOutputCP(CP_UTF8);
+int main(int argc, char **argv) {
+    std::vector<std::string> args = platform::args_utf8(argc, argv);  // UTF-8 on every platform
+    platform::console_utf8();
     if (args.empty() || args[0] == "-h" || args[0] == "--help") { fputs(kUsage, stdout); return args.empty() ? 2 : 0; }
+    if (args[0] == "--version" || args[0] == "-V") { printf("nefcomp %s\n", NEFCOMP_VERSION); return 0; }
     if (args[0] == "info") return cmd_info({args.begin() + 1, args.end()});
     if (args[0] == "decode" || args[0] == "skeleton" || args[0] == "assemble") {
         try {

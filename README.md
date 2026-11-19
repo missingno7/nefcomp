@@ -7,12 +7,33 @@ Shrinks Nikon NEF raw files after shooting:
 * **any NEF → JPEG XL raw DNG** for cameras without HE (e.g. Z 6). The DNG keeps the raw mosaic
   and carries the original NEF's metadata, so `nefcomp restore` rebuilds a genuine Nikon NEF from it.
 
+Originals are never modified: outputs are new files (written as `.part`, renamed when complete).
+
+## Download
+
+Prebuilt binaries are on the [releases page](https://github.com/missingno7/nefcomp/releases):
+one self-contained command-line program per platform, no installation. Unpack and run it from a
+terminal (`nefcomp --help`).
+
+| platform | archive | notes |
+| --- | --- | --- |
+| Windows 10/11 x64 | `nefcomp-<version>-windows-x64.zip` | `nefcomp.exe` |
+| Linux x64 | `nefcomp-<version>-linux-x64.tar.gz` | static binary, any distribution |
+| macOS 11+ (Apple silicon and Intel) | `nefcomp-<version>-macos-universal.tar.gz` | not notarized: `xattr -d com.apple.quarantine nefcomp` once, or allow it in System Settings → Privacy & Security |
+
+* **HE NEF conversion, `restore` and `info` work on all three.**
+* **`--dng` needs [Adobe DNG Converter](https://helpx.adobe.com/camera-raw/using/adobe-dng-converter.html)**
+  (free), which exists for Windows and macOS only. On Linux, make the DNGs on Windows/macOS;
+  restoring them works everywhere. DNGs and restores are identical across platforms.
+* Check a download against `SHA256SUMS` from the same release.
+
 ```
 nefcomp [options] <file.NEF | dir> ...          lossless NEF -> HE / HE* NEF; HE* -> HE (-m he)
 nefcomp --dng [options] <file.NEF | dir> ...    NEF -> JPEG XL raw DNG (restorable)
 nefcomp --auto [options] <file.NEF | dir> ...   per file: HE NEF where possible, DNG otherwise
 nefcomp restore [options] <file.dng | dir> ...  DNG made by --dng -> genuine Nikon NEF (lossless by default)
 nefcomp info <file.NEF> ...
+nefcomp --version
 
   -r, --recursive        include subfolders (with -o, the folder structure is mirrored)
   -m, --mode MODE        hestar (default) | he | lossless (lossless: --dng / --auto only)
@@ -176,10 +197,25 @@ Adobe decodes differently from nefcomp are refused when the DNG is made, never w
 
 ## Build
 
-MSYS2 MinGW-w64 g++: `mingw32-make` produces one static `nefcomp.exe`.
-`third_party/libjxl` holds a static libjxl 0.11.1 built with the same compiler
-(CMake + Ninja from Visual Studio, `-DBUILD_SHARED_LIBS=OFF`, tools/tests off).
-`--dng` needs Adobe DNG Converter installed (tested with 17.2 and 19.0); it is used to produce Adobe's colour profile and metadata.
+C++17 with GCC or Clang, one `make`. Dependencies are static libjxl 0.11.1 and libjpeg-turbo:
+
+```
+sh third_party/build_libjxl.sh  .work/jxl  .deps/jxl     # needs git, CMake (Ninja optional)
+sh third_party/build_libjpeg.sh .work/jpeg .deps/jpeg
+make JXL=$PWD/.deps/jxl JPEG_LIB=$PWD/.deps/jpeg/lib/libjpeg.a JPEG_CFLAGS=-I$PWD/.deps/jpeg/include
+```
+
+* **Windows:** MSYS2 MinGW-w64 (`mingw32-make` or MSYS `make`) gives a static `nefcomp.exe`.
+  `third_party/libjxl` holds a prebuilt MinGW libjxl, so plain `mingw32-make` works with the
+  MSYS2 `libjpeg-turbo` package.
+* **Linux:** a fully static `nefcomp`. **macOS:** set `CC=clang CXX=clang++`; third-party
+  libraries are linked statically.
+* `.github/workflows/build.yml` builds all three, runs `tools/ci_smoke.sh` (a public raw.pixls.us
+  sample must convert to the same HE★ bytes on every platform) and packages them with
+  `tools/package_release.sh`. A `v*` tag creates a draft release.
+
+`--dng` needs Adobe DNG Converter installed (tested with 17.2 and 19.0); it is used to produce
+Adobe's colour profile and metadata.
 
 ## HE / HE★ NEF
 
@@ -307,7 +343,8 @@ Adobe DNG Converter accepts all DNGs and restored NEFs, and its decode of the DN
 * `third_party/nikon-he-public`: public HE decoder from LibRaw PR #826 (Dmitri Sotnikov, with
   z8-qemu fixes), LGPL-2.1 / CDDL. Used for `--verify` and for decoding HE sources.
 * `third_party/libjxl`: libjxl 0.11.1 (BSD-3-Clause, with its bundled highway / brotli / skcms),
-  built with JPEG transcoding. libjpeg-turbo (MSYS2) for regenerated previews.
+  built with JPEG transcoding. libjpeg-turbo for regenerated previews. Licence texts of everything
+  linked into the binaries: `THIRD_PARTY_NOTICES.md` (and `licenses/` in release archives).
 * Nikon lossless/uncompressed formats follow dcraw / LibRaw.
 * This program is therefore GPL-2.0-or-later. Nikon, Adobe and intoPIX own their trademarks and
   patents. This is an independent interoperability tool for your own files.

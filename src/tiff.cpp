@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include "platform.h"
 
 namespace nefcomp {
 
@@ -141,10 +142,10 @@ bool set_nef_compression_code(Buf &b, const NefLayout &L, unsigned code) {
 }
 
 std::string read_file(const std::string &path, std::vector<uint8_t> &out) {
-    FILE *f = _wfopen(std::filesystem::u8path(path).wstring().c_str(), L"rb");  // UTF-8 path
+    FILE *f = platform::open_file(path, "rb");  // UTF-8 path
     if (!f) return "cannot open " + path;
     std::fseek(f, 0, SEEK_END);
-    long long n = _ftelli64(f);
+    long long n = platform::tell64(f);
     std::fseek(f, 0, SEEK_SET);
     if (n < 0) { std::fclose(f); return "cannot size " + path; }
     out.resize(size_t(n));
@@ -154,7 +155,7 @@ std::string read_file(const std::string &path, std::vector<uint8_t> &out) {
 }
 
 void write_file(const std::string &path, const std::vector<uint8_t> &data) {
-    FILE *f = _wfopen(std::filesystem::u8path(path).wstring().c_str(), L"wb");
+    FILE *f = platform::open_file(path, "wb");
     if (!f) throw std::runtime_error("cannot create " + path);
     bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
     if (std::fclose(f) != 0 || !ok) throw std::runtime_error("write failed " + path);
