@@ -14,6 +14,7 @@
 // Everything else (previews, Exif, encrypted blocks) is left untouched.
 
 #include "nef_convert.h"
+#include "he_decode.h"
 #include "nikon_lossless.h"
 #include "tiff.h"
 
@@ -192,10 +193,13 @@ ConvertResult convert_lossless_to_he(const std::vector<uint8_t> &file, const HeE
     auto *e51 = L.makernote.find(0x51);
     if (!e51 || e51->size() < 11) throw std::runtime_error("makernote tag 0x51 (NEF compression) missing");
     unsigned code = b.d[e51->value_pos + 10];
-    if (code == 13 || code == 14) throw std::runtime_error("file is already High Efficiency");
-    if (code != 3) throw std::runtime_error("file is not lossless compressed (code " + std::to_string(code) + ")");
+    const unsigned target = unsigned(opt_in.mode);
+    if (code == target) throw std::runtime_error(code == 14 ? "file is already High Efficiency*" : "file is already High Efficiency");
+    if (code == 13) throw std::runtime_error("file is already High Efficiency (smaller than HE*); HE* would only be larger");
+    const bool from_he = code == 14;  // HE* -> HE re-encode
+    if (code != 3 && !from_he) throw std::runtime_error("file is not lossless compressed (code " + std::to_string(code) + ")");
     auto *e96 = L.makernote.find(0x96);
-    if (!e96) throw std::runtime_error("makernote tag 0x96 (linearization table) missing");
+    if (!from_he && !e96) throw std::runtime_error("makernote tag 0x96 (linearization table) missing");
     if (auto *cfa = L.raw_ifd.find(0x828e)) {
         if (cfa->count != 4 || b.d[cfa->value_pos] != 0 || b.d[cfa->value_pos + 1] != 1 ||
             b.d[cfa->value_pos + 2] != 1 || b.d[cfa->value_pos + 3] != 2)
@@ -215,11 +219,15 @@ ConvertResult convert_lossless_to_he(const std::vector<uint8_t> &file, const HeE
         res.warnings.push_back("black level tag missing; assuming 1008");
     }
 
-    // 1. decode the lossless raw data
+    // 1. decode the source raw data
     std::string err;
-    if (!decode_nikon_lossless(&b.d[L.strip_off], L.strip_len, &b.d[e96->value_pos], e96->size(), L.makernote.le,
-                               L.width, L.height, L.bps, res.source_cfa, err))
+    if (from_he) {
+        if (!he_decode(&b.d[L.strip_off], L.strip_len, L.width, L.height, res.source_cfa, err))
+            throw std::runtime_error("HE* decode failed: " + err);
+    } else if (!decode_nikon_lossless(&b.d[L.strip_off], L.strip_len, &b.d[e96->value_pos], e96->size(), L.makernote.le,
+                                      L.width, L.height, L.bps, res.source_cfa, err)) {
         throw std::runtime_error("lossless decode failed: " + err);
+    }
     res.width = L.width; res.height = L.height; res.black = black;
 
     // 2. encode HE
@@ -249,7 +257,7 @@ ConvertResult convert_lossless_to_he(const std::vector<uint8_t> &file, const HeE
         if (auto *m = nb.find(0x0d)) {
             if (m->data.size() != 8 || std::memcmp(m->data.data(), "0100", 4) != 0 || !crc_ok(m->data))
                 throw std::runtime_error("0xC7D5/0x000D has an unknown layout");
-            if (m->data[4] != 3) throw std::runtime_error("0xC7D5 compression field disagrees with makernote");
+            if (m->data[4] != code) throw std::runtime_error("0xC7D5 compression field disagrees with makernote");
             m->data[4] = mode;
             m->data[5] = 0;
             fix_crc(m->data);

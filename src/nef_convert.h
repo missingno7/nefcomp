@@ -35,7 +35,7 @@ struct ConvertResult {
     std::vector<std::string> warnings;
 };
 
-// Convert a lossless-compressed Nikon NEF into an HE / HE* NEF.
+// Convert a lossless-compressed Nikon NEF into an HE / HE* NEF, or an HE* NEF into HE.
 // `allow_untested_model`: permit cameras other than the Z 8 (whose own HE files
 // the container changes were derived from).
 ConvertResult convert_lossless_to_he(const std::vector<uint8_t> &file, const HeEncodeOptions &opt,

@@ -8,7 +8,7 @@ Shrinks Nikon NEF raw files after shooting:
   and carries the original NEF's metadata, so `nefcomp restore` rebuilds a genuine Nikon NEF from it.
 
 ```
-nefcomp [options] <file.NEF | dir> ...          lossless NEF -> HE / HE* NEF
+nefcomp [options] <file.NEF | dir> ...          lossless NEF -> HE / HE* NEF; HE* -> HE (-m he)
 nefcomp --dng [options] <file.NEF | dir> ...    NEF -> JPEG XL raw DNG (restorable)
 nefcomp --auto [options] <file.NEF | dir> ...   per file: HE NEF where possible, DNG otherwise
 nefcomp restore [options] <file.dng | dir> ...  DNG made by --dng -> NEF in its original format
@@ -31,7 +31,7 @@ nefcomp info <file.NEF> ...
       --suffix TEXT      output suffix (default _HEs / _HE for NEF, none for DNG)
       --verify           report the error against the original samples
       --overwrite        replace existing outputs (default: skip them)
-      --force            --dng: also convert files that are already HE (usually larger)
+      --force            write a DNG even if it is not smaller than the original NEF
       --allow-untested   allow HE NEF output for cameras other than the Z 8
   -j, --threads N        encoder threads
 ```
@@ -50,11 +50,18 @@ nefcomp restore -r -o D:\Photos\back E:\Archive
 Pass folders and/or files; `-r` includes subfolders. nefcomp first **plans** every file, then runs
 the plan:
 
-| mode | lossless NEF, HE camera (Z 8) | lossless / uncompressed NEF, other camera | already HE / HE★ | lossy NEF |
-| --- | --- | --- | --- | --- |
-| default | HE NEF | skip (hint: `--auto` / `--dng`) | skip | skip |
-| `--dng` | DNG | DNG | skip (`--force` converts) | skip |
-| `--auto` | HE NEF | DNG | skip | skip |
+| mode | lossless NEF, HE camera (Z 8) | lossless / uncompressed NEF, other camera | HE★ NEF | HE NEF | lossy NEF |
+| --- | --- | --- | --- | --- | --- |
+| default (`-m hestar`) | HE★ NEF | skip (hint: `--auto` / `--dng`) | skip | skip (HE★ would be larger) | skip |
+| `-m he` | HE NEF | skip | **HE NEF** (re-encoded) | skip | skip |
+| `--dng` | DNG | DNG | DNG | DNG | skip |
+| `--auto` | HE★ NEF (HE with `-m he`) | DNG | skip (HE with `-m he`) | skip | skip |
+
+* **Not smaller:** a DNG that would not be smaller than its NEF (e.g. an HE file at the default q70)
+  is skipped with its sizes shown. Lower `-q` / `--bpp`, or use `--force` to write it anyway.
+* **HE★ → HE:** the HE★ data is decoded and re-encoded at 3 bpp, a second lossy generation (rms 9–18 DN
+  over the HE★ pixels on the samples). The container is patched like a camera HE file; Adobe decodes
+  it bit-identically.
 
 * **Outputs:** without `-o` they go next to the originals; with `-o DIR` they go into DIR, and with `-r` the
   input folder structure is mirrored (`DCIM\100NCZ_8\…`). An `-o` path without an extension is a folder.

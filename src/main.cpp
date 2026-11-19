@@ -24,7 +24,7 @@ static const char *kUsage =
     "nefcomp - shrink Nikon NEF raw files after shooting\n"
     "\n"
     "usage:\n"
-    "  nefcomp [options] <file.NEF | directory> ...    lossless NEF -> HE / HE* NEF\n"
+    "  nefcomp [options] <file.NEF | directory> ...    lossless NEF -> HE / HE* NEF; HE* -> HE (-m he)\n"
     "  nefcomp --dng [options] <file.NEF | dir> ...    NEF -> JPEG XL raw DNG (restorable)\n"
     "  nefcomp restore [options] <file.dng | dir> ...  DNG made by --dng -> original-format NEF\n"
     "  nefcomp info <file.NEF> ...\n"
@@ -47,7 +47,7 @@ static const char *kUsage =
     "      --suffix TEXT      output name suffix (default _HEs / _HE for NEF, none for DNG)\n"
     "      --verify           report the reconstruction error against the original samples\n"
     "      --overwrite        replace existing output files (default: skip them)\n"
-    "      --force            --dng: also convert files that are already HE (usually larger)\n"
+    "      --force            write a DNG even if it is not smaller than the original NEF\n"
     "      --allow-untested   allow HE NEF output for cameras other than the Nikon Z 8\n"
     "  -j, --threads N        encoder threads (default: all cores)\n";
 
@@ -135,6 +135,8 @@ static size_t convert_he(const fs::path &in, const fs::path &out, const Options 
     return r.output.size();
 }
 
+struct SkipError : std::runtime_error { using std::runtime_error::runtime_error; };
+
 static size_t convert_dng(const fs::path &in, const fs::path &out, const Options &o) {
     auto t0 = std::chrono::steady_clock::now();
     DngOptions opt;
@@ -147,8 +149,13 @@ static size_t convert_dng(const fs::path &in, const fs::path &out, const Options
     opt.threads = o.threads;
     opt.dng_converter = o.dng_converter;
     DngResult r = nef_to_jxl_dng(in.string(), opt);
-    if (r.dng.size() >= fs::file_size(in))
-        printf("  warning: %s: the DNG is not smaller than the NEF\n", in.string().c_str());
+    if (r.dng.size() >= fs::file_size(in)) {
+        char why[200];
+        snprintf(why, sizeof why, "DNG would not be smaller (%.1f MB -> %.1f MB); lower -q / --bpp, or --force",
+                 double(fs::file_size(in)) / 1e6, r.dng.size() / 1e6);
+        if (!o.force) throw SkipError(why);
+        printf("  warning: %s: %s\n", in.string().c_str(), why);
+    }
     write_atomic(out, r.dng);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     char qs[64];
@@ -237,18 +244,27 @@ static void plan_nef(Job &j, const Options &o) {
     }
     const bool is_he = raw.format == RawFormat::HE || raw.format == RawFormat::HEStar;
     const bool lossless = raw.format == RawFormat::Lossless;
-    const bool to_dng_ok = lossless || raw.format == RawFormat::Packed14 || (is_he && o.force);
+    const bool to_dng_ok = lossless || raw.format == RawFormat::Packed14 || is_he;
     const bool he_ok = he_verified_model(info.model) || (o.allow_untested && he_capable_model(info.model));
+    // HE* -> HE is a valid step down; HE -> HE* would only grow the file
+    const bool downgrade = raw.format == RawFormat::HEStar && o.mode == HeMode::HE && he_ok;
     std::string fmt = nef_format_name(info.compression_code);
-    if (is_he && !(o.dng && o.force)) { j.why = "already " + fmt; return; }
+    auto already = [&]() {
+        j.why = raw.format == RawFormat::HE && o.mode == HeMode::HEStar && !o.dng
+                    ? "already High Efficiency (smaller than HE*)"
+                    : "already " + fmt;
+    };
     if (o.dng) {
         if (!to_dng_ok) { j.why = "unsupported raw format (" + fmt + ")"; return; }
         j.act = Act::DNG;
     } else if (o.auto_mode) {
-        if (lossless && he_ok) j.act = Act::HE;
+        if ((lossless && he_ok) || downgrade) j.act = Act::HE;
+        else if (is_he) already();
         else if (to_dng_ok) j.act = Act::DNG;
         else j.why = "unsupported raw format (" + fmt + ")";
     } else {
+        if (downgrade) { j.act = Act::HE; return; }
+        if (is_he) { already(); return; }
         if (!lossless) { j.why = "not lossless compressed (" + fmt + "); try --dng"; return; }
         if (!he_capable_model(info.model)) { j.why = info.model + " has no HE mode; use --auto or --dng"; return; }
         if (!he_ok) { j.why = info.model + ": HE output untested (--allow-untested, or --dng)"; return; }
@@ -357,6 +373,10 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
             ok++;
             bytes_in += in_size;
             bytes_out += out_size;
+        } catch (const SkipError &ex) {
+            printf("  skip %s: %s\n", j.in.string().c_str(), ex.what());
+            skipped++;
+            tally(ex.what());
         } catch (const std::exception &ex) {
             std::string msg = ex.what();
             if (restore && msg.find("no embedded NEF") != std::string::npos) {
