@@ -19,7 +19,8 @@ nefcomp info <file.NEF> ...
       --dng              write a JPEG XL DNG instead of an HE NEF (needs Adobe DNG Converter)
   DNG options:
   -q, --quality Q        1..100: 100 = lossless, 70 = hestar (default), 55 = he
-      --bpp B            aim for B bits per raw pixel instead (HE* = 5, HE = 3)
+      --bpp B            instead of -q: target size, B bits per raw pixel on average
+                         (not bit depth; data stays 14-bit). HE* = 5, HE = 3
       --effort E         JPEG XL effort 1..9 (default 7)
       --keep-previews    store the camera JPEG previews (lossless JPEG recompression);
                          with -m lossless, restore gives a byte-identical NEF.
@@ -94,7 +95,9 @@ measured against the lossless originals. Error is the rms difference in 14-bit r
 * NEF sizes include ~4.9 MB (Z 8) of camera previews. DNGs carry ~0.7 MB of Adobe metadata,
   and their previews are regenerated on restore.
 
-**bpp** = compressed raw-data bits ÷ sensor pixels (metadata and previews excluded). 1 bpp is
+**bpp** = compressed raw-data bits ÷ sensor pixels (metadata and previews excluded). It's a size
+target, not bit depth: the data stays 14-bit. `-q`, `--bpp`, `--distance` and `-m lossless` are
+alternatives; nefcomp rejects combinations. 1 bpp is
 5.71 MB on a Z 8 FX, 2.44 MB on Z 8 DX and 3.06 MB on a Z 6. Uncompressed is 14 bpp, Nikon
 lossless ~8–11, HE★ 5 and HE 3. HE and `--bpp` are constant size: busy scenes lose more. `--bpp`
 bisects the JPEG XL distance on every 5th tile and lands within ~3 %. `-q` is constant quality:

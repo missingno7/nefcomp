@@ -35,7 +35,8 @@ static const char *kUsage =
     "                         any camera Adobe DNG Converter supports (needs it installed)\n"
     "  DNG options:\n"
     "  -q, --quality Q        1..100: 100 = lossless, 70 = hestar (default), 55 = he\n"
-    "      --bpp B            aim for B bits per raw pixel instead (HE* = 5, HE = 3)\n"
+    "      --bpp B            instead of -q: target size, B bits per raw pixel on average\n"
+    "                         (not bit depth; data stays 14-bit). HE* = 5, HE = 3\n"
     "      --effort E         JPEG XL effort 1..9 (default 7)\n"
     "      --keep-previews    store the camera's JPEG previews (losslessly recompressed);\n"
     "                         with -m lossless, restore then gives a byte-identical NEF.\n"
@@ -45,7 +46,8 @@ static const char *kUsage =
     "  -o, --output PATH      output file (single input) or directory\n"
     "      --suffix TEXT      output name suffix (default _HEs / _HE for NEF, none for DNG)\n"
     "      --verify           report the reconstruction error against the original samples\n"
-    "      --overwrite        replace existing output files\n"
+    "      --overwrite        replace existing output files (default: skip them)\n"
+    "      --force            --dng: also convert files that are already HE (usually larger)\n"
     "      --allow-untested   allow HE NEF output for cameras other than the Nikon Z 8\n"
     "  -j, --threads N        encoder threads (default: all cores)\n";
 
@@ -465,6 +467,10 @@ int main(int argc, char **argv) {
         if (o.lossless && !o.dng && !o.auto_mode && !restore)
             throw std::runtime_error("-m lossless is only available with --dng / --auto");
         if (o.dng && o.auto_mode) throw std::runtime_error("use either --dng or --auto");
+        int quality_opts = (o.quality >= 0) + (o.bpp > 0) + (o.distance >= 0) + o.lossless;
+        if (quality_opts > 1)
+            throw std::runtime_error("choose one of -q (quality), --bpp (size target), --distance or -m lossless; "
+                                     "they are alternatives, not combinable");
     } catch (const std::exception &ex) {
         fprintf(stderr, "%s\n\n%s", ex.what(), kUsage);
         return 2;
