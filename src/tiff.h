@@ -49,6 +49,7 @@ struct NefLayout {
     size_t mn_tiff = 0;   // absolute position of the makernote's embedded TIFF header
     unsigned width = 0, height = 0, bps = 0, compression = 0;
     size_t strip_off = 0, strip_len = 0;
+    unsigned strip_count = 1;  // several contiguous strips are treated as one block
 };
 
 // check_strip=false accepts a "skeleton" (file truncated at the raw strip).

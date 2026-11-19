@@ -1,3 +1,8 @@
+/* nefcomp modification, 2026-11-19: the significance substream size is computed
+ * per line block from the sub-band layout, ceil(sum(ceil(ng / 8)) / 8) bytes,
+ * instead of ceil(half_width / 256) for all line blocks. They agree for the
+ * Z 8 / Z 9 / Z f widths; the Z50II (5600 px) needs the exact rule.
+ * Original copyright and dual-license notices follow unchanged. */
 /* -*- C++ -*-
  * File: nikon_he_precinct_header.cpp
  * Copyright (C) 2026 Dmitri Sotnikov
@@ -20,6 +25,7 @@ it under the terms of the one of two licenses as you choose:
 // See nikon_he_precinct_header.h for the public API.
 
 #include "nikon_he_precinct_header.h"
+#include "nikon_he_subband_config.h"
 #include <cstring>
 
 namespace nikon_he {
@@ -28,6 +34,25 @@ namespace nikon_he {
 // 1 LB mini-header (7 bytes) = 19. We don't bound the full header up-front
 // because LB mini-headers are INTERLEAVED with their substreams.
 static constexpr size_t kMinHeaderPrefix = 19;
+
+// Significance bytes per line block: one bit per 8 coefficient groups of
+// each of the line block's sub-bands, packed and padded to a byte.
+static void lb_sig_sizes(int half_pass_width, uint32_t out[kLineBlocksPerPrecinct]) {
+    static thread_local int cached_width = -1;
+    static thread_local uint32_t cached[kLineBlocksPerPrecinct];
+    if (cached_width != half_pass_width) {
+        static const int kLbStart[9] = {0, 6, 12, 13, 19, 21, 23, 24, 26};
+        SubbandConfig config[26];
+        compute_subband_layout(half_pass_width, config);
+        for (int lb = 0; lb < kLineBlocksPerPrecinct; lb++) {
+            uint32_t bits = 0;
+            for (int sb = kLbStart[lb]; sb < kLbStart[lb + 1]; sb++) bits += (config[sb].ng + 7) / 8;
+            cached[lb] = (bits + 7) / 8;
+        }
+        cached_width = half_pass_width;
+    }
+    std::memcpy(out, cached, sizeof cached);
+}
 
 // Read a big-endian uint32_t from an unaligned byte pointer.
 static inline uint32_t read_be(const uint8_t* p, int bytes) {
@@ -79,6 +104,8 @@ bool parse_precinct_header(const uint8_t* data,
     //   f2c bytes sign substream
     // The next mini-header starts immediately after the previous LB's
     // sign substream.
+    uint32_t sig_sizes[kLineBlocksPerPrecinct];
+    lb_sig_sizes(image_width / 2, sig_sizes);
     size_t cursor = 12;   // after prefix (3+1+1+7 = 12 bytes)
     for (int lb = 0; lb < kLineBlocksPerPrecinct; lb++) {
         if (cursor + 7 > data_size) return false;
@@ -93,7 +120,7 @@ bool parse_precinct_header(const uint8_t* data,
         out.lb_data_bytes[lb] = static_cast<uint32_t>((val >> 35) & 0xFFFFF);
         out.lb_gcli_bytes[lb] = static_cast<uint32_t>((val >> 15) & 0xFFFFF);
         out.lb_sign_bytes[lb] = static_cast<uint32_t>( val        & 0x7FFF);
-        out.lb_sig_bytes [lb] = static_cast<uint32_t>(out.f20);
+        out.lb_sig_bytes [lb] = sig_sizes[lb];
 
         cursor += 7;                                 // past mini-header
         out.lb_sig_offset[lb] = static_cast<uint32_t>(cursor);  // sig starts here

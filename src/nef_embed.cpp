@@ -20,6 +20,9 @@
 //   7 lossy-NEF curve (code -> 14-bit value) used for the raw data, uint16 LE, brotli
 //   8 raw border pixels cropped off in the DNG: a=x, b=y, w/h = crop size; payload =
 //     4 x (u32 length + lossless JPEG XL) for the top, bottom, left and right areas
+//   9 lossy-NEF code overrides (curve ties): varint index delta + u16 code, brotli
+//  10 raw strip padding: bytes the camera wrote after the end of the raw stream (a = 0: appended),
+//     or the differing end of a same-size strip (a = 1: overwrites the strip's last bytes)
 
 #include "nef_embed.h"
 #include "nef_convert.h"
@@ -33,6 +36,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -41,7 +46,7 @@ namespace nefcomp {
 namespace {
 
 constexpr char kMagic[12] = {'N', 'E', 'F', 'C', 'O', 'M', 'P', '-', 'S', 'K', 'E', 'L'};
-enum Kind : uint8_t { kJpegRegen = 1, kRgbRegen = 2, kMakernote = 3, kPack12 = 4, kPack6 = 5, kJpegKept = 6, kLossyCurve = 7, kRawMargins = 8 };
+enum Kind : uint8_t { kJpegRegen = 1, kRgbRegen = 2, kMakernote = 3, kPack12 = 4, kPack6 = 5, kJpegKept = 6, kLossyCurve = 7, kRawMargins = 8, kCodeOverrides = 9, kStripTail = 10 };
 
 struct Record {
     uint8_t kind = 0;
@@ -206,14 +211,15 @@ std::vector<uint8_t> dng_private_makernote(const std::vector<uint8_t> &pd) {
 
 std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vector<uint16_t> &px,
                                  const std::vector<uint8_t> &dng_mn, bool keep_previews, EmbedStats *st,
-                                 const std::vector<uint16_t> *lossy_curve, const RawCrop *crop) {
+                                 const std::vector<uint16_t> *lossy_curve, const RawCrop *crop,
+                                 const std::vector<uint16_t> *lossy_codes, bool exact_intent) {
     EmbedStats s;
     Buf b;
     b.d = nef;
     NefLayout L = parse_nef(b);
-    const size_t skel_len = L.strip_off;
+    std::vector<uint8_t> resid = nef_skeleton(nef);  // strip removed (or zeroed when data follows it)
+    const size_t skel_len = resid.size();
     s.skeleton = skel_len;
-    std::vector<uint8_t> resid(nef.begin(), nef.begin() + skel_len);
     std::vector<Record> recs;
     auto zero = [&](size_t off, size_t len) { std::memset(&resid[off], 0, len); };
 
@@ -240,7 +246,8 @@ std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vec
         else if (ifd.find(0x111) && ifd.find(0x117) && ifd.find(0x111)->count == 1) { eo = ifd.find(0x111); ec = ifd.find(0x117); }
         if (!eo) continue;
         size_t off = b.uint_val(ifd, *eo), len = b.uint_val(ifd, *ec);
-        if (off == L.strip_off || len == 0 || off + len > skel_len) continue;
+        if (off == L.strip_off || len == 0 || off + len > skel_len ||
+            (off < L.strip_off + L.strip_len && off + len > L.strip_off)) continue;
         Record r;
         r.off = off; r.len = len;
         if (ec->count == 1 && ec->type == 4) { r.count_pos = ec->value_pos; r.flags = uint8_t(2 | (ifd.le ? 1 : 0)); }
@@ -298,7 +305,8 @@ std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vec
     }
 
     if (crop) {
-        const unsigned NW = L.width, NH = L.height;
+        const NefRaw nr = describe_raw(nef);
+        const unsigned NW = nr.width, NH = nr.height;
         Record r;
         r.kind = kRawMargins;
         r.w = crop->w; r.h = crop->h; r.a = crop->x; r.b = crop->y;
@@ -322,6 +330,27 @@ std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vec
         }
         recs.push_back(std::move(r));
     }
+    if (lossy_curve && lossy_codes && !lossy_curve->empty()) {
+        auto ov = lossy_code_overrides(*lossy_codes, *lossy_curve);
+        if (!ov.empty()) {
+            std::vector<uint8_t> raw;
+            uint32_t prev = 0;
+            for (const auto &o : ov) {
+                uint32_t d = o.index - prev;
+                prev = o.index;
+                while (d >= 0x80) { raw.push_back(uint8_t(d | 0x80)); d >>= 7; }
+                raw.push_back(uint8_t(d));
+                raw.push_back(uint8_t(o.code));
+                raw.push_back(uint8_t(o.code >> 8));
+            }
+            Record r;
+            r.kind = kCodeOverrides;
+            r.w = uint32_t(ov.size());
+            r.h = uint32_t(raw.size());
+            r.payload = brotli_compress(raw.data(), raw.size());
+            recs.push_back(std::move(r));
+        }
+    }
     if (lossy_curve && !lossy_curve->empty()) {
         Record r;
         r.kind = kLossyCurve;
@@ -330,6 +359,40 @@ std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vec
         for (size_t i = 0; i < lossy_curve->size(); i++) { raw[2 * i] = uint8_t((*lossy_curve)[i]); raw[2 * i + 1] = uint8_t((*lossy_curve)[i] >> 8); }
         r.payload = brotli_compress(raw.data(), raw.size());
         recs.push_back(std::move(r));
+    }
+    // exact DNGs: keep any padding the camera wrote after the raw stream
+    if (exact_intent) {
+        try {
+            std::vector<CodeOverride> ov;
+            if (lossy_curve && lossy_codes) ov = lossy_code_overrides(*lossy_codes, *lossy_curve);
+            Buf rb;
+            rb.d = nef_assemble(nef_skeleton(nef), px, lossy_curve, ov.empty() ? nullptr : &ov);
+            NefLayout RL = parse_nef(rb);
+            size_t ours = RL.strip_len, orig = L.strip_len;
+            if (RL.strip_off == L.strip_off && orig > ours && orig - ours <= 4096 &&
+                std::equal(rb.d.begin() + RL.strip_off, rb.d.begin() + RL.strip_off + ours, nef.begin() + L.strip_off)) {
+                Record r;
+                r.kind = kStripTail;
+                r.payload.assign(nef.begin() + L.strip_off + ours, nef.begin() + L.strip_off + orig);
+                recs.push_back(std::move(r));
+            } else if (RL.strip_off == L.strip_off && orig == ours) {
+                // same size, the end differs: uncompressed strips padded with leftover
+                // data (Coolpix P6000-P7100 pad to 4096 bytes); a = 1 means "overwrite"
+                const uint8_t *o = nef.data() + L.strip_off, *q = rb.d.data() + RL.strip_off;
+                size_t same = 0;
+                while (same < ours && o[same] == q[same]) same++;
+                if (same < ours && ours - same <= 4096) {
+                    Record r;
+                    r.kind = kStripTail;
+                    r.a = 1;
+                    r.payload.assign(o + same, o + ours);
+                    recs.push_back(std::move(r));
+                }
+            }
+        } catch (const std::exception &e) {
+            if (getenv("NEFCOMP_DEBUG")) fprintf(stderr, "strip tail: %s\n", e.what());
+            // formats nefcomp cannot re-encode exactly (e.g. HE) simply get no tail
+        }
     }
     auto rz = brotli_compress(resid.data(), resid.size());
     Writer w;
@@ -366,6 +429,9 @@ std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::
     const uint8_t *fh = rd.take(32), *ph = rd.take(32);
     std::vector<uint8_t> skel;
     std::vector<uint16_t> lossy_curve;
+    std::vector<CodeOverride> overrides;
+    std::vector<uint8_t> strip_tail;
+    bool strip_tail_overwrite = false;
     if (ver == 1) {
         skel = zdecompress(rd.p, size_t(rd.end - rd.p));
     } else if (ver == 2) {
@@ -382,6 +448,26 @@ std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::
             const uint8_t *p = rd.take(size_t(pl));
             r.payload.assign(p, p + pl);
             if (r.off + r.len > skel.size()) throw std::runtime_error("embedded record out of range");
+            if (r.kind == kStripTail) { strip_tail = r.payload; strip_tail_overwrite = r.a == 1; }
+            if (r.kind == kCodeOverrides) {
+                std::vector<uint8_t> raw;
+                if (!brotli_decompress(r.payload.data(), r.payload.size(), r.h, raw))
+                    throw std::runtime_error("corrupt embedded code overrides");
+                size_t at = 0;
+                uint32_t idx = 0;
+                for (uint32_t k = 0; k < r.w; k++) {
+                    uint32_t d = 0;
+                    for (int sh = 0; at < raw.size(); sh += 7) {
+                        uint8_t c = raw[at++];
+                        d |= uint32_t(c & 0x7f) << sh;
+                        if (!(c & 0x80)) break;
+                    }
+                    if (at + 2 > raw.size()) throw std::runtime_error("corrupt embedded code overrides");
+                    idx += d;
+                    overrides.push_back({idx, uint16_t(raw[at] | raw[at + 1] << 8)});
+                    at += 2;
+                }
+            }
             if (r.kind == kLossyCurve) {
                 std::vector<uint8_t> raw;
                 if (!brotli_decompress(r.payload.data(), r.payload.size(), size_t(r.w) * 2, raw))
@@ -465,18 +551,42 @@ std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::
     switch (describe_raw(skel, false).format) {
     case RawFormat::Lossless: ri.original_format = "lossless"; break;
     case RawFormat::Lossy: ri.original_format = "lossy compressed"; break;
-    case RawFormat::Packed14: ri.original_format = "uncompressed"; break;
+    case RawFormat::Uncompressed: ri.original_format = "uncompressed"; break;
     case RawFormat::HE: ri.original_format = "High Efficiency"; break;
     case RawFormat::HEStar: ri.original_format = "High Efficiency*"; break;
     default: ri.original_format = "unknown";
     }
-    if (to_lossless && describe_raw(skel, false).format != RawFormat::Lossless && describe_raw(skel, false).bps == 14) {
-        skel = skeleton_to_lossless(skel);   // 12-bit originals keep their own format
+    // lossless restore: HE always (every HE camera shoots lossless), lossy only for
+    // cameras that write lossless NEFs; uncompressed is already lossless
+    const RawFormat ofmt = describe_raw(skel, false).format;
+    const bool convertible = ofmt == RawFormat::HE || ofmt == RawFormat::HEStar ||
+                             (ofmt == RawFormat::Lossy && lossless_capable_model(nef_model(skel)));
+    if (to_lossless && convertible) {
+        skel = skeleton_to_lossless(skel);
         lossy_curve.clear();
         ri.converted_to_lossless = true;
     }
     ri.pixels_exact = std::memcmp(sha_px(px).data(), ph, 32) == 0;
-    std::vector<uint8_t> nef = nef_assemble(skel, px, lossy_curve.empty() ? nullptr : &lossy_curve);
+    // code overrides describe the original codes: only valid when the pixels are exact
+    std::vector<uint8_t> nef = nef_assemble(skel, px, lossy_curve.empty() ? nullptr : &lossy_curve,
+                                            ri.pixels_exact && !overrides.empty() ? &overrides : nullptr);
+    if (ri.pixels_exact && !strip_tail.empty() && !ri.converted_to_lossless) {
+        Buf nb;
+        nb.d = std::move(nef);
+        NefLayout NL = parse_nef(nb);
+        const size_t end = NL.strip_off + NL.strip_len;
+        bool ok = NL.strip_count == 1;
+        if (strip_tail_overwrite) {
+            if (strip_tail.size() <= NL.strip_len) std::copy(strip_tail.begin(), strip_tail.end(), nb.d.begin() + end - strip_tail.size());
+            ok = false;  // size unchanged
+        } else if (ok && end == nb.d.size()) nb.d.insert(nb.d.end(), strip_tail.begin(), strip_tail.end());
+        else if (ok && end + strip_tail.size() <= nb.d.size() &&
+                 std::all_of(nb.d.begin() + end, nb.d.begin() + end + strip_tail.size(), [](uint8_t c) { return c == 0; }))
+            std::copy(strip_tail.begin(), strip_tail.end(), nb.d.begin() + end);  // zeroed slot of the original strip
+        else ok = false;
+        if (ok) nb.w32(NL.raw_ifd.find(0x117)->value_pos, uint32_t(NL.strip_len + strip_tail.size()), NL.raw_ifd.le);
+        nef = std::move(nb.d);
+    }
     ri.file_exact = std::memcmp(sha256(nef.data(), nef.size()).data(), fh, 32) == 0;
     if (info) *info = ri;
     return nef;

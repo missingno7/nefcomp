@@ -27,7 +27,8 @@ struct EmbedStats {
 // lossy_curve: for lossy NEFs, the code -> value curve that produced `px`.
 std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vector<uint16_t> &px,
                                  const std::vector<uint8_t> &dng_makernote, bool keep_previews, EmbedStats *st,
-                                 const std::vector<uint16_t> *lossy_curve = nullptr, const RawCrop *crop = nullptr);
+                                 const std::vector<uint16_t> *lossy_curve = nullptr, const RawCrop *crop = nullptr,
+                                 const std::vector<uint16_t> *lossy_codes = nullptr, bool exact_intent = false);
 
 struct EmbedRestore {
     bool pixels_exact = false, file_exact = false;

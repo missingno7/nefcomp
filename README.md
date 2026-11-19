@@ -3,7 +3,7 @@
 Shrinks Nikon NEF raw files after shooting:
 
 * **lossless NEF → High Efficiency (HE) / High Efficiency★ (HE★) NEF**, exactly the format the
-  camera writes. For cameras with HE (verified on the Z 8).
+  camera writes. For cameras with HE (verified on all of them: Z 8, Z 9, Z f, Z6III, Z50II, Z5II, ZR).
 * **any NEF → JPEG XL raw DNG** for cameras without HE (e.g. Z 6). The DNG keeps the raw mosaic
   and carries the original NEF's metadata, so `nefcomp restore` rebuilds a genuine Nikon NEF from it.
 
@@ -33,7 +33,7 @@ nefcomp info <file.NEF> ...
       --overwrite        replace existing outputs (default: skip them)
       --force            write a DNG even if it is not smaller than the original NEF
       --as FORMAT        restore: lossless (default) | original
-      --allow-untested   allow HE NEF output for cameras other than the Z 8
+      --allow-untested   allow HE NEF output for HE cameras not yet verified
   -j, --threads N        encoder threads
 ```
 
@@ -51,7 +51,7 @@ nefcomp restore -r -o D:\Photos\back E:\Archive
 Pass folders and/or files; `-r` includes subfolders. nefcomp first **plans** every file, then runs
 the plan:
 
-| mode | lossless NEF, HE camera (Z 8) | lossless / uncompressed / lossy NEF, other camera | HE★ NEF | HE NEF | |
+| mode | lossless NEF, verified HE camera | lossless / uncompressed / lossy NEF, other camera | HE★ NEF | HE NEF | |
 | --- | --- | --- | --- | --- | --- |
 | default (`-m hestar`) | HE★ NEF | skip (hint: `--auto` / `--dng`) | skip | skip (HE★ would be larger) | |
 | `-m he` | HE NEF | skip | **HE NEF** (re-encoded) | skip | |
@@ -83,14 +83,14 @@ the plan:
   HE   ...\100NCZ_8\DSC_7338.NEF -> E:\Archive\DCIM\100NCZ_8\DSC_7338_HEs.NEF: 56.7 MB -> 33.5 MB (HE*)
   skip ...\100NCZ_8\DSC_7339.NEF: already High Efficiency*
   DNG  ...\101NZ_6\DSC_1208.NEF -> E:\Archive\DCIM\101NZ_6\DSC_1208.dng: 30.2 MB -> 13.6 MB (...)
-  skip ...\101NZ_6\DSC_1207.NEF: unsupported raw format (lossy compressed)
+  skip ...\102D4S\FU9_3802.NEF: unsupported raw format (small-size NEF (no raw mosaic))
 done: 4 converted (158.2 MB -> 75.2 MB, saved 83.0 MB = 52%), 5 skipped, 0 failed
   skipped 4 x already High Efficiency
   skipped 1 x unsupported raw format
 ```
 
-`--auto` writes HE NEFs only for the Z 8 (the verified model). Other HE-capable bodies (Z 9, Z f, …)
-get DNGs unless `--allow-untested` is given. Files run one after another, each using all cores.
+`--auto` writes HE NEFs for the verified models, which are all cameras with an HE mode. Future
+HE bodies get DNGs until verified, unless `--allow-untested` is given. Files run one after another, each using all cores.
 
 ### HE vs JPEG XL DNG equivalents
 
@@ -126,29 +126,60 @@ exact restores possible; `-m lossless --keep-previews` restores byte-identical N
 
 ### Tested cameras and formats
 
-| camera | formats tested | notes |
-| --- | --- | --- |
-| Nikon Z 8 (FW 3.10, 4.06) | lossless, HE★, HE (FX and DX) | HE NEF output; DNG; HE★ → HE |
-| Nikon Z 6 (FW 3.50) | lossless, lossy, uncompressed | DNG only (no HE in camera) |
-| Nikon D7000 (FW 1.05) | lossless (big-endian file, 2010) | DNG; Adobe crops 44 masked columns |
+Every file below passes the regression (`tools/regress.py`): Adobe DNG Converter decodes nefcomp's
+DNG; an exact (`-m lossless --keep-previews`) DNG restores a **byte-identical** NEF; the default
+lossless restore has raw data equal to the DNG and opens in Adobe. Own files plus CC0 samples from
+[raw.pixls.us](https://raw.pixls.us), at least one per raw format family.
+
+| raw format | cameras tested |
+| --- | --- |
+| HE★ / HE (14-bit) | Z 8, Z 9, Z f, Z6III, Z50II (5600 px), Z5II, ZR |
+| lossless 14-bit | Z 8, Z 7, Z 6, Z f, Z 9, Z6III, Z5II, D850, D800, D700, D7000, D5100, D500, D6, D3 |
+| lossless 12-bit | D6, Z 6, Z 50 (data after the strip) |
+| lossy 14-bit | Z 6, D6, D3, D780 (0x4440), Coolpix A |
+| lossy 12-bit | D6 (0x4440), Z 6, 1 J2, 1 V1, D90 |
+| lossy with "split" rows | Z 6II, D7000, D5000, D5, D5600, D3400, 1 J5 |
+| lossy type 1 (0x4410 table, split) | D2H, D40, D80 (odd Adobe crop) |
+| lossy, D1X (table in makernote 0x008C, bare-IFD makernote) | D1X |
+| uncompressed 14-bit packed | Z 6, D6 |
+| uncompressed 12-bit packed (LE, plain / row-padded) | Z 6, D4S |
+| uncompressed 16-bit words (TIFF compression 1) | D3, D4S, D300 |
+| uncompressed 12-bit MSB, multi-strip | D1, D200 |
+| uncompressed 12-bit with pad byte (D100) | D100 |
+| Coolpix, 12-bit in 32-bit words | P1000, P950, B700; P6000, P7000, P7100 (strip padded to 4096 bytes) |
+| Coolpix, 12-bit MSB / 16-bit words | P340; P7700 (value << 4, kept at Adobe's 16-bit scale); A1000 (TIFF compression 1) |
+| Coolpix E, 12-bit MSB interlaced (even rows, then odd rows) | E5400, E8400, E8800 |
 
 What makes this general:
-* **Compression code:** read from makernote 0x0051 (Z bodies) or 0x0093 (older bodies).
-* **Lossless encoder:** reproduces Z 8, Z 6 and D7000 files byte-for-byte, so Nikon's encoder hasn't changed in 15 years.
+* **Format detection** follows LibRaw: TIFF compression, byte count vs. size, makernote 0x0051/0x0093
+  compression code and the 0x0096 table version.
+* **Encoders:** Nikon's lossless and lossy Huffman encoders are reproduced exactly (the camera pads the
+  last byte with 1-bits). Lossy "split" streams switch to a coarser tree from a given row on; there the
+  camera quantizes differences and an overshoot below zero is stored as zero (Adobe's reading; LibRaw
+  keeps the negative value and drifts by a few codes). nefcomp encodes with the same closed loop.
+* **Exact extras** (kept in exact DNGs): codes the lossy curve maps to the same value (ties), padding
+  the camera wrote after the raw stream, and strips followed by other data (the strip slot is kept).
 * **Adobe crop:** when Adobe crops the raw, nefcomp finds the crop by exact matching. The DNG stores Adobe's
   region, the cropped-off border goes losslessly into the embedded data, and `restore` puts it back.
 * **Black level:** the companding curve uses Adobe's black level (0 on the D7000, 1008 on Z bodies).
+* **Odd crops:** the Bayer plane split needs even sizes, so an odd Adobe crop (D80: 2611 rows) takes
+  one more NEF row into the DNG and an ActiveArea keeps Adobe's region.
+* **16-bit Coolpix files** (P7700): Adobe keeps the 16-bit word scale; nefcomp's LinearizationTable
+  outputs the same scale.
+* **Restore format:** HE/HE★ and lossy files from cameras that shoot lossless come back as lossless
+  NEFs (12- or 14-bit, with Nikon's table in the makernote's byte order); lossy files from bodies
+  without a lossless mode (D40…D5600, Nikon 1, Coolpix) and uncompressed files keep their own format.
 
-Not supported: 12-bit lossless/lossy files are decoded, but untested and restored only in their own format.
-"Split" lossy streams (some older bodies), 12-bit packed uncompressed and small-size NEFs are skipped
-with a reason.
+Not supported (skipped with a reason): small-size NEFs (sRAW, YCbCr), Coolpix bodies with CMYG
+sensors (E5700, …). Files whose raw data
+Adobe decodes differently from nefcomp are refused when the DNG is made, never written.
 
 ## Build
 
 MSYS2 MinGW-w64 g++: `mingw32-make` produces one static `nefcomp.exe`.
 `third_party/libjxl` holds a static libjxl 0.11.1 built with the same compiler
 (CMake + Ninja from Visual Studio, `-DBUILD_SHARED_LIBS=OFF`, tools/tests off).
-`--dng` needs Adobe DNG Converter installed; it is used to produce Adobe's colour profile and metadata.
+`--dng` needs Adobe DNG Converter installed (tested with 17.2 and 19.0); it is used to produce Adobe's colour profile and metadata.
 
 ## HE / HE★ NEF
 
@@ -176,6 +207,27 @@ Container changes, derived by diffing lossless / HE / HE★ files shot back to b
 The picture header is byte-identical to the Z 8's (FX and DX, firmware 3.10 and 4.06).
 Adobe DNG Converter decodes the output bit-identically to the bundled public decoder, and the files
 open in Camera Raw.
+
+**Verified cameras:**
+
+| camera | how |
+| --- | --- |
+| Z 8 | container derived from back-to-back lossless / HE / HE★ shots; Camera Raw |
+| Z 9, Z f (FW 1.00) | lossless (raw.pixls.us) → HE / HE★ matches the camera's own HE / HE★ files in every format field; Adobe decodes identically |
+| Z50II (FW 1.00), ZR (FW 1.00.00, 1.01) | camera HE★ (Photography Blog) → lossless → HE★ reproduces every container field of the camera file; Adobe decodes identically |
+| Z6III, Z5II (FW 1.00) | lossless (Photography Blog) → HE / HE★: same field changes and header as the verified bodies; Adobe decodes identically (no camera HE sample found) |
+
+"Every format field": codestream header (155 bytes), strip size, raw-IFD and makernote tag layout,
+0xC7D5 items 0x000D/0x000E/0x000F and makernote 0x0051/0x0058. Per-shot items (0xC7D5
+0x0006–0x0009, 0x0010) differ between shots, as they do between the camera's own files. Error vs.
+the lossless source: HE★ 2.6–3.5 DN rms, HE 8.7–10.4 DN.
+
+The Z50II exposed a bug shared by the bundled decoder and nefcomp's encoder: each line block's
+significance substream is `ceil(Σ ceil(ng/8) / 8)` bytes over its sub-bands, not
+`ceil(width/2/256)`. The two agree for the Z 8, Z 9, Z f and Z6III widths, but at 5600 px three
+line blocks need 12 bytes instead of 11, so Z50II files didn't decode before.
+
+Checking the Z5II needs an Adobe DNG Converter newer than 17.2 (verified with 19.0).
 
 **Cameras without an HE mode can't use this.** Adobe and LibRaw enable HE decoding only for models
 that shoot HE (Z 9, Z 8, Z f, Z6III, Z50II, Z5II, ZR). A Z 8 HE file relabelled "NIKON Z 6" is
@@ -213,8 +265,9 @@ nefcomp refuses such models and points to `--dng`.
    which NX Studio browsing, Windows thumbnails and the camera's playback show. Raw data and all
    metadata are unaffected. v1 DNGs are still restorable.
 
-`nefcomp restore` decodes the tiles and writes a **lossless NEF** by default, whatever the original
-format was (HE★, HE, lossy, uncompressed). That's the failsafe: no loss beyond what the DNG already
+`nefcomp restore` decodes the tiles and writes a **lossless NEF** by default for HE★, HE and lossy
+originals (lossy only from cameras that shoot lossless themselves; uncompressed originals stay
+uncompressed, which is lossless too). That's the failsafe: no loss beyond what the DNG already
 has, and the file can be edited in camera and opened in NX Studio. The container gets the camera's
 lossless metadata (mode 3, zeroed size fields, Nikon's lossless table in makernote 0x0096 and
 0xC7D5/0x000E, which is identical on every Z 8 / Z 6 lossless file examined). Where the table has to be

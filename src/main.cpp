@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // nefcomp - shrink Nikon NEF files after shooting:
-//   * lossless NEF -> High Efficiency (HE / HE*) NEF   (cameras with HE: Z 8, ...)
+//   * lossless NEF -> High Efficiency (HE / HE*) NEF   (verified: every HE camera, Z 8 ... ZR)
 //   * any NEF      -> JPEG XL raw DNG that can be turned back into the NEF
 #include "dng_jxl.h"
 #include "he_decode.h"
@@ -25,10 +25,12 @@ static const char *kUsage =
     "\n"
     "usage:\n"
     "  nefcomp [options] <file.NEF | directory> ...    lossless NEF -> HE / HE* NEF; HE* -> HE (-m he)\n"
-    "  nefcomp --dng [options] <file.NEF | dir> ...    NEF -> JPEG XL raw DNG (restorable)\n"
+    "  nefcomp --dng [options] <file.NEF|NRW | dir>    NEF -> JPEG XL raw DNG (restorable)\n"
     "  nefcomp restore [options] <file.dng | dir> ...  DNG made by --dng -> genuine Nikon NEF:\n"
     "                                                  lossless NEF by default (no extra loss, editable\n"
-    "                                                  in camera); --as original = original NEF format\n"
+    "                                                  in camera; uncompressed originals and lossy ones\n"
+    "                                                  from bodies without lossless keep their format);\n"
+    "                                                  --as original = original NEF format\n"
     "  nefcomp info <file.NEF> ...\n"
     "\n"
     "options:\n"
@@ -50,7 +52,7 @@ static const char *kUsage =
     "      --verify           report the reconstruction error against the original samples\n"
     "      --overwrite        replace existing output files (default: skip them)\n"
     "      --force            write a DNG even if it is not smaller than the original NEF\n"
-    "      --allow-untested   allow HE NEF output for cameras other than the Nikon Z 8\n"
+    "      --allow-untested   allow HE NEF output for HE cameras not yet verified\n"
     "  -j, --threads N        encoder threads (default: all cores)\n";
 
 struct Options {
@@ -70,6 +72,35 @@ static std::string lower_ext(const fs::path &p) {
     std::string e = p.extension().string();
     for (auto &c : e) c = char(std::tolower(static_cast<unsigned char>(c)));
     return e;
+}
+
+static bool raw_input_ext(const fs::path &p) {
+    std::string e = lower_ext(p);
+    return e == ".nef" || e == ".nrw";
+}
+
+// Extension for a restored raw: ".NRW" when the DNG's OriginalRawFileName says
+// the camera wrote an NRW (Coolpix), else ".NEF". Reads only the file start.
+static std::string restored_ext(const fs::path &dng) {
+    std::vector<uint8_t> d(1 << 20);
+    FILE *f = _wfopen(dng.wstring().c_str(), L"rb");
+    if (!f) return ".NEF";
+    d.resize(fread(d.data(), 1, d.size(), f));
+    fclose(f);
+    try {
+        Buf b;
+        b.d = std::move(d);
+        if (b.d.size() < 8 || (b.d[0] != 'I' && b.d[0] != 'M')) return ".NEF";
+        bool le = b.d[0] == 'I';
+        Ifd i0 = b.read_ifd(b.u32(4, le), 0, le);
+        if (auto *e = i0.find(0xc68b); e && e->value_pos + e->size() <= b.d.size()) {
+            std::string n(b.d.begin() + e->value_pos, b.d.begin() + e->value_pos + e->size());
+            n = n.c_str();
+            if (lower_ext(fs::path(n)) == ".nrw") return ".NRW";
+        }
+    } catch (const std::exception &) {
+    }
+    return ".NEF";
 }
 
 static void write_atomic(const fs::path &out, const std::vector<uint8_t> &data) {
@@ -253,11 +284,11 @@ static void plan_nef(Job &j, const Options &o) {
     }
     const bool is_he = raw.format == RawFormat::HE || raw.format == RawFormat::HEStar;
     const bool lossless = raw.format == RawFormat::Lossless;
-    const bool to_dng_ok = lossless || raw.format == RawFormat::Packed14 || raw.format == RawFormat::Lossy || is_he;
+    const bool to_dng_ok = lossless || raw.format == RawFormat::Uncompressed || raw.format == RawFormat::Lossy || is_he;
     const bool he_ok = he_verified_model(info.model) || (o.allow_untested && he_capable_model(info.model));
     // HE* -> HE is a valid step down; HE -> HE* would only grow the file
     const bool downgrade = raw.format == RawFormat::HEStar && o.mode == HeMode::HE && he_ok;
-    std::string fmt = nef_format_name(info.compression_code);
+    std::string fmt = raw.why.empty() ? nef_format_name(info.compression_code) : raw.why;
     auto already = [&]() {
         j.why = raw.format == RawFormat::HE && o.mode == HeMode::HEStar && !o.dng
                     ? "already High Efficiency (smaller than HE*)"
@@ -300,7 +331,7 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
         if (fs::is_directory(p, ec)) {
             any_dir = true;
             auto add = [&](const fs::directory_entry &de) {
-                if (!de.is_regular_file() || lower_ext(de.path()) != in_ext) return;
+                if (!de.is_regular_file() || (restore ? lower_ext(de.path()) != in_ext : !raw_input_ext(de.path()))) return;
                 if (out_given && fs::is_directory(o.output) && under(de.path(), o.output)) return;  // our outputs
                 jobs.push_back({fs::path(de.path()).lexically_normal().make_preferred(), fs::path(p).lexically_normal().make_preferred(), {}, Act::Skip, ""});
             };
@@ -315,7 +346,7 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
             return 2;
         }
     }
-    if (jobs.empty()) { fprintf(stderr, "no %s files found%s\n", restore ? ".dng" : ".NEF", o.recursive ? "" : " (use -r for subfolders)"); return 2; }
+    if (jobs.empty()) { fprintf(stderr, "no %s files found%s\n", restore ? ".dng" : ".NEF/.NRW", o.recursive ? "" : " (use -r for subfolders)"); return 2; }
     std::sort(jobs.begin(), jobs.end(), [](const Job &a, const Job &b) { return a.in < b.in; });
     const bool out_is_dir = out_given && (jobs.size() > 1 || any_dir || fs::is_directory(o.output) ||
                                           o.output.back() == '\\' || o.output.back() == '/' ||
@@ -328,7 +359,7 @@ static int run_batch(Options &o, const std::vector<std::string> &inputs, bool re
         if (j.act == Act::Skip) continue;
         std::string suffix = o.suffix_set ? o.suffix
                              : j.act == Act::HE ? (o.mode == HeMode::HE ? "_HE" : "_HEs") : "";
-        std::string ext = j.act == Act::HE ? j.in.extension().string() : j.act == Act::DNG ? ".dng" : ".NEF";
+        std::string ext = j.act == Act::HE ? j.in.extension().string() : j.act == Act::DNG ? ".dng" : restored_ext(j.in);
         fs::path name = j.in.stem().string() + suffix + ext;
         if (!out_given) j.out = j.in.parent_path() / name;
         else if (out_is_dir) {
@@ -426,6 +457,10 @@ int main(int argc, char **argv) {
                 std::vector<uint16_t> px;
                 if (lower_ext(args[1]) == ".dng") px = jxl_dng_decode(d, info.width, info.height);
                 else px = decode_raw(d, &info);
+                if (getenv("NEFCOMP_CODES") && info.format == RawFormat::Lossy) {  // debugging: raw int16 codes
+                    std::vector<uint16_t> curve;
+                    decode_raw_codes(d, px, curve);
+                }
                 std::vector<uint8_t> o(px.size() * 2);
                 memcpy(o.data(), px.data(), o.size());
                 write_file(args[2], o);

@@ -1,5 +1,7 @@
 #include "nikon_lossless.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace nefcomp {
@@ -72,30 +74,35 @@ static bool parse_meta(const uint8_t *meta, size_t meta_len, bool le, unsigned b
                             {uint16_t(rd16(meta + mp + 4, le)), uint16_t(rd16(meta + mp + 6, le))}};
     std::memcpy(m.vpred, vpred, sizeof vpred);
     mp += 8;
-    unsigned maxv = (1u << bps) & 0x7fff;
+    // curve (LibRaw nikon_read_curve)
+    unsigned table_codes = 0, split = 0;
+    unsigned cmax = (1u << bps) & 0x7fff, step = cmax;
     unsigned csize = rd16(meta + mp, le); mp += 2;
+    if (csize > 1) step = cmax / (csize - 1);
     std::vector<uint16_t> curve(0x10000);
     for (unsigned i = 0; i < curve.size(); i++) curve[i] = uint16_t(i);
-    unsigned step = csize > 1 ? maxv / (csize - 1) : 0, split = 0;
-    if (ver0 == 0x44 && (ver1 == 0x20 || (ver1 == 0x40 && bps == 14)) && step > 0) {
+    if (ver0 == 0x44 && (ver1 == 0x20 || (ver1 == 0x40 && step > 3)) && step > 0) {
         // lossy: sampled curve, linearly interpolated
-        if (ver1 == 0x40) { step /= 4; maxv /= 4; }
-        if (mp + 2 * csize > meta_len || meta_len < 564) { err = "curve truncated"; return false; }
+        if (ver1 == 0x40) { step /= 4; cmax /= 4; }
+        if (mp + 2 * csize > meta_len) { err = "curve truncated"; return false; }
         for (unsigned i = 0; i < csize; i++) curve[i * step] = uint16_t(rd16(meta + mp + 2 * i, le));
-        for (unsigned i = 0; i < maxv; i++)
+        for (unsigned i = 0; i < cmax; i++)
             curve[i] = uint16_t((curve[i - i % step] * (step - i % step) + curve[i - i % step + step] * (i % step)) / step);
-        split = rd16(meta + 562, le);
-    } else if (ver0 != 0x46 && csize > 1 && csize <= 0x4001) {
+        if (meta_len >= 564) split = rd16(meta + 562, le);
+    } else if (ver0 != 0x46 && csize <= 0x4001) {
         if (mp + 2 * csize > meta_len) { err = "curve truncated"; return false; }
         for (unsigned i = 0; i < csize; i++) curve[i] = uint16_t(rd16(meta + mp + 2 * i, le));
-        maxv = csize;
-    } else if (ver0 != 0x46) {
-        err = "unsupported NEF compression variant"; return false;
+        table_codes = csize;  // valid codes are those the table defines
     }
+    // code range and split row (LibRaw nikon_load_raw)
+    unsigned maxv = table_codes ? table_codes : cmax;
     while (maxv > 2 && curve[maxv - 2] == curve[maxv - 1]) maxv--;
     m.tree = tree;
     m.lossy = ver0 == 0x44;
-    m.curve.assign(curve.begin(), curve.begin() + maxv);
+    // curve over every code the stream can hold (after a split row: up to maxv + 15)
+    const unsigned domain = split ? std::min(maxv + 16, 0x4000u) : maxv;
+    m.curve.assign(curve.begin(), curve.begin() + domain);
+    for (unsigned i = maxv; i < domain; i++) m.curve[i] = curve[std::min(i, 0x3fffu)];
     m.maxv = maxv;
     m.split = split;
     return true;
@@ -111,22 +118,20 @@ static bool decode_impl(const uint8_t *strip, size_t strip_len, const uint8_t *m
     const int tree = m.tree;
     uint16_t vpred[2][2];
     std::memcpy(vpred, m.vpred, sizeof vpred);
-    unsigned maxv = m.maxv, split = m.split;
-    std::vector<uint16_t> curve(0x10000);
-    for (unsigned i = 0; i < curve.size(); i++) curve[i] = uint16_t(i);
-    std::copy(m.curve.begin(), m.curve.end(), curve.begin());
+    const unsigned maxv = m.maxv, split = m.split;
+    const std::vector<uint16_t> &curve = m.curve;
     if (curve_out) *curve_out = m.curve;
     if (maxv_out) *maxv_out = maxv;
     if (split_out) *split_out = split;
-    unsigned minv = 0;
     Huff huff0(kTrees[tree]), huff1(kTrees[std::min(tree + 1, 5)]);
     const Huff *hp = &huff0;
+    bool after_split = false;
     BitReader br(strip, strip_len);
     out.assign(size_t(width) * height, 0);
     uint16_t hpred[2] = {0, 0};
     for (unsigned row = 0; row < height; row++) {
         uint16_t *dst = out.data() + size_t(row) * width;
-        if (split && row == split) { hp = &huff1; minv = 16; maxv += minv << 1; }
+        if (split && row == split) { hp = &huff1; after_split = true; }
         for (unsigned col = 0; col < width; col++) {
             unsigned e = hp->lut[br.peek16()];
             unsigned l = e >> 8;
@@ -136,11 +141,19 @@ static bool decode_impl(const uint8_t *strip, size_t strip_len, const uint8_t *m
             int len = i & 15, shl = i >> 4;
             int diff = ((int(br.get(len - shl)) << 1) + 1) << shl >> 1;
             if (len > 0 && (diff & (1 << (len - 1))) == 0) diff -= (1 << len) - !shl;
-            if (col < 2) hpred[col] = vpred[row & 1][col] = uint16_t(vpred[row & 1][col] + diff);
-            else hpred[col & 1] = uint16_t(hpred[col & 1] + diff);
-            if (uint16_t(hpred[col & 1] + minv) >= maxv) { err = "predictor out of range"; return false; }
-            int v = std::clamp<int>(int16_t(hpred[col & 1]), 0, 0x3fff);
-            dst[col] = want_codes ? uint16_t(v) : curve[v];
+            int v = int(col < 2 ? vpred[row & 1][col] : hpred[col & 1]) + diff;
+            if (after_split) {
+                // coarse symbols can overshoot: like Adobe, a value below zero is
+                // stored (and predicts the next one) as zero
+                v = std::max(v, 0);
+                if (v > 0x7fff) { err = "predictor out of range"; return false; }
+            } else if (v < 0 || unsigned(v) >= maxv) {
+                err = "predictor out of range";
+                return false;
+            }
+            if (col < 2) vpred[row & 1][col] = uint16_t(v);
+            hpred[col & 1] = uint16_t(v);
+            dst[col] = want_codes ? uint16_t(v) : curve[std::min<size_t>(unsigned(v), curve.size() - 1)];
         }
         if (br.p >= br.end && br.cnt < 0) { err = "strip truncated"; return false; }
     }
@@ -156,27 +169,43 @@ bool decode_nikon_codes(const uint8_t *strip, size_t strip_len, const uint8_t *m
                         unsigned width, unsigned height, unsigned bps, std::vector<uint16_t> &codes,
                         std::vector<uint16_t> &curve, std::string &err) {
     unsigned maxv = 0, split = 0;
-    if (!decode_impl(strip, strip_len, meta, meta_len, le, width, height, bps, codes, err, true, &curve, &maxv, &split))
-        return false;
-    if (split) { err = "split lossy NEF streams are not supported"; return false; }
-    return true;
+    return decode_impl(strip, strip_len, meta, meta_len, le, width, height, bps, codes, err, true, &curve, &maxv, &split);
 }
 
 namespace {
+// Every difference a Huffman tree can express, with its complete bit pattern
+// (Huffman code + extra bits). A symbol is (shl << 4) | len: `len` is the
+// magnitude class, and `shl` low bits are implied, so only some differences
+// of that class exist (the trees used after a lossy "split" row).
 struct HuffEnc {
-    uint16_t code[16] = {0};
-    uint8_t len[16] = {0};
-    explicit HuffEnc(const uint8_t *tree) {
+    static constexpr int kOff = 1 << 16;
+    std::vector<uint32_t> bits;
+    std::vector<uint8_t> nbits;  // 0: not representable
+    std::vector<int> diffs;      // sorted representable differences
+    explicit HuffEnc(const uint8_t *tree) : bits(2 * kOff, 0), nbits(2 * kOff, 0) {
         const uint8_t *counts = tree, *sym = tree + 16;
         unsigned c = 0, pos = 0;
+        bool seen[16] = {false};
         for (unsigned l = 1; l <= 16; l++) {
-            for (unsigned i = 0; i < counts[l - 1]; i++) {
-                if (sym[pos] < 16 && !len[sym[pos]]) { code[sym[pos]] = uint16_t(c); len[sym[pos]] = uint8_t(l); }
-                c++; pos++;
+            for (unsigned i = 0; i < counts[l - 1]; i++, c++, pos++) {
+                int len = sym[pos] & 15, shl = sym[pos] >> 4;
+                if (seen[len] || shl > len) continue;  // the decoder's first symbol of a class wins
+                seen[len] = true;
+                for (unsigned x = 0; x < (1u << (len - shl)) || (len == shl && x == 0); x++) {
+                    int diff = ((int(x) << 1) + 1) << shl >> 1;  // same arithmetic as the decoder
+                    if (len > 0 && (diff & (1 << (len - 1))) == 0) diff -= (1 << len) - !shl;
+                    if (len == 0) diff = 0;
+                    bits[diff + kOff] = (c << (len - shl)) | x;
+                    nbits[diff + kOff] = uint8_t(l + len - shl);
+                    diffs.push_back(diff);
+                    if (len == shl) break;
+                }
             }
             c <<= 1;
         }
+        std::sort(diffs.begin(), diffs.end());
     }
+    bool exact(int d) const { return d > -kOff && d < kOff && nbits[d + kOff]; }
 };
 struct BitWriter {
     std::vector<uint8_t> &out;
@@ -192,28 +221,64 @@ struct BitWriter {
 };
 } // namespace
 
-static bool encode_huffman(const uint16_t *px, unsigned width, unsigned height, int tree, unsigned maxv,
-                           const uint16_t seeds[2][2], std::vector<uint8_t> &out, std::string &err) {
-    HuffEnc h(kTrees[tree]);
+// px: samples (lossless) or int16 codes (lossy). `lossy`: out-of-range values
+// are clamped and differences the tree cannot express are quantized to the
+// nearest representable one (closed loop, like the camera); the codes that
+// result are written back to px. Lossless input must be exactly representable.
+static bool encode_huffman(uint16_t *px, unsigned width, unsigned height, int tree, unsigned maxv, unsigned split,
+                           const uint16_t seeds[2][2], bool lossy, std::vector<uint8_t> &out, std::string &err) {
+    HuffEnc h0(kTrees[tree]), h1(kTrees[std::min(tree + 1, 5)]);
+    const HuffEnc *h = &h0;
     out.clear();
     out.reserve(size_t(width) * height * 3 / 2);
     BitWriter bw(out);
-    int vpred[2][2] = {{seeds[0][0], seeds[0][1]}, {seeds[1][0], seeds[1][1]}};
+    int vpred[2][2] = {{int16_t(seeds[0][0]), int16_t(seeds[0][1])}, {int16_t(seeds[1][0]), int16_t(seeds[1][1])}};
+    bool after_split = false;
     for (unsigned row = 0; row < height; row++) {
-        const uint16_t *src = px + size_t(row) * width;
+        uint16_t *src = px + size_t(row) * width;
+        if (split && row == split) { h = &h1; after_split = true; }
+        // stored values: [0, maxv) before the split; after it a value is
+        // max(0, prediction + difference) and may exceed maxv slightly
+        const int lo = 0, hi = after_split ? 0x3fff : int(maxv) - 1;
         int hpred[2] = {0, 0};
         for (unsigned col = 0; col < width; col++) {
-            int v = src[col];
-            if (v >= int(maxv)) { err = "sample exceeds bit depth"; return false; }
-            int pred = col < 2 ? vpred[row & 1][col] : hpred[col & 1];
+            int v = lossy ? int(int16_t(src[col])) : int(src[col]);
+            if (v < lo || v > hi) {
+                if (!lossy) { err = "sample exceeds bit depth"; return false; }
+                v = std::clamp(v, lo, hi);
+            }
+            const int pred = col < 2 ? vpred[row & 1][col] : hpred[col & 1];
             int diff = v - pred;
+            if (!h->exact(diff) || (!after_split && pred + diff != v)) {
+                if (!lossy) { err = "difference out of Huffman range"; return false; }
+                // nearest representable difference (the camera quantizes the same way)
+                auto stored = [&](int k) { return std::max(pred + k, 0); };
+                auto better = [&](int a, int b) {  // a closer than b?
+                    int ea = std::abs(stored(a) - v), eb = std::abs(stored(b) - v);
+                    return ea != eb ? ea < eb : std::abs(pred + a - v) < std::abs(pred + b - v);
+                };
+                const auto it = std::lower_bound(h->diffs.begin(), h->diffs.end(), diff);
+                bool found = false;
+                int best = 0;
+                for (auto k = it; k != h->diffs.end() && stored(*k) <= hi; ++k)
+                    if (pred + *k >= lo || after_split) { best = *k; found = true; break; }
+                for (auto k = it; k != h->diffs.begin();) {
+                    --k;
+                    if (pred + *k < lo && !after_split) break;
+                    if (stored(*k) <= hi) {
+                        if (!found || better(*k, best)) best = *k;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) { err = "no representable difference"; return false; }
+                diff = best;
+            }
+            v = after_split ? std::max(pred + diff, 0) : pred + diff;
             if (col < 2) vpred[row & 1][col] = v;
             hpred[col & 1] = v;
-            unsigned a = unsigned(diff < 0 ? -diff : diff), len = 0;
-            while (a >> len) len++;
-            if (len > 15 || !h.len[len]) { err = "difference out of Huffman range"; return false; }
-            bw.put(h.code[len], h.len[len]);
-            if (len) bw.put(diff < 0 ? unsigned(diff + (1 << len) - 1) : unsigned(diff), len);
+            if (lossy) src[col] = uint16_t(v);
+            bw.put(h->bits[diff + HuffEnc::kOff], h->nbits[diff + HuffEnc::kOff]);
         }
     }
     bw.flush();
@@ -227,7 +292,8 @@ bool encode_nikon_lossless(const uint16_t *px, unsigned width, unsigned height, 
     if (bps != 14 && bps != 12) { err = "unsupported bit depth"; return false; }
     uint16_t seeds[2][2] = {{uint16_t(rd16(meta + 2, le)), uint16_t(rd16(meta + 4, le))},
                             {uint16_t(rd16(meta + 6, le)), uint16_t(rd16(meta + 8, le))}};
-    return encode_huffman(px, width, height, bps == 14 ? 5 : 2, 1u << bps, seeds, out, err);
+    return encode_huffman(const_cast<uint16_t *>(px), width, height, bps == 14 ? 5 : 2, 1u << bps, 0, seeds, false,
+                          out, err);  // lossless: px is not modified
 }
 
 bool nikon_lossy_curve(const uint8_t *meta, size_t meta_len, bool le, unsigned bps, std::vector<uint16_t> &curve,
@@ -239,13 +305,13 @@ bool nikon_lossy_curve(const uint8_t *meta, size_t meta_len, bool le, unsigned b
     return true;
 }
 
-bool encode_nikon_lossy(const uint16_t *codes, unsigned width, unsigned height, unsigned bps, const uint8_t *meta,
+bool encode_nikon_lossy(std::vector<uint16_t> &codes, unsigned width, unsigned height, unsigned bps, const uint8_t *meta,
                         size_t meta_len, bool le, std::vector<uint8_t> &out, std::string &err) {
     NefMeta m;
     if (!parse_meta(meta, meta_len, le, bps, m, err)) return false;
     if (!m.lossy) { err = "encoder needs a lossy (0x44) linearization table"; return false; }
-    if (m.split) { err = "split lossy NEF streams are not supported"; return false; }
-    return encode_huffman(codes, width, height, m.tree, m.maxv, m.vpred, out, err);
+    if (codes.size() != size_t(width) * height) { err = "code count mismatch"; return false; }
+    return encode_huffman(codes.data(), width, height, m.tree, m.maxv, m.split, m.vpred, true, out, err);
 }
 
 size_t nikon_packed14_stride(unsigned width) { return (size_t(width) * 7 / 4 + 15) / 16 * 16; }

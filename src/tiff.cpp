@@ -92,8 +92,14 @@ NefLayout parse_nef(const Buf &b, bool check_strip) {
     };
     L.width = req(0x100); L.height = req(0x101); L.bps = req(0x102); L.compression = req(0x103);
     auto *so = r.find(0x111), *sc = r.find(0x117);
-    if (!so || !sc || so->count != 1 || sc->count != 1) throw std::runtime_error("raw IFD must have exactly one strip");
-    L.strip_off = b.uint_val(r, *so); L.strip_len = b.uint_val(r, *sc);
+    if (!so || !sc || so->count == 0 || so->count != sc->count) throw std::runtime_error("raw IFD has no usable strips");
+    L.strip_off = b.uint_val(r, *so);
+    L.strip_len = 0;
+    L.strip_count = so->count;
+    for (unsigned i = 0; i < so->count; i++) {  // several strips: must be one contiguous block
+        if (b.uint_val(r, *so, i) != L.strip_off + L.strip_len) throw std::runtime_error("raw strips are not contiguous");
+        L.strip_len += b.uint_val(r, *sc, i);
+    }
     if (check_strip) b.need(L.strip_off, L.strip_len);
     if (auto *e = L.ifd0.find(0x8769)) {
         L.exif = b.read_ifd(b.uint_val(L.ifd0, *e), 0, L.le);
@@ -105,6 +111,13 @@ NefLayout parse_nef(const Buf &b, bool check_strip) {
                 bool mle = b.d[L.mn_tiff] == 'I';
                 L.makernote = b.read_ifd(L.mn_tiff + b.u32(L.mn_tiff + 4, mle), L.mn_tiff, mle);
                 L.have_makernote = true;
+            } else {
+                // D1-era makernote: a bare IFD with offsets relative to the file
+                try {
+                    Ifd m = b.read_ifd(p, 0, L.le);
+                    if (!m.entries.empty() && m.entries.size() < 512) { L.makernote = m; L.have_makernote = true; }
+                } catch (const std::exception &) {
+                }
             }
         }
     }

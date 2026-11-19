@@ -122,7 +122,34 @@ bool he_capable_model(const std::string &model) {
     for (auto *m : kHeModels) if (model == m) return true;
     return false;
 }
-bool he_verified_model(const std::string &model) { return model == "NIKON Z 8"; }
+// Verified: container fields and codestream header byte-identical to the camera's
+// own HE/HE* files, and Adobe decodes the output identically to nefcomp.
+bool he_verified_model(const std::string &model) {
+    // Z50II, ZR: camera HE* -> lossless -> HE* reproduces every format field of the
+    // camera file. Z6III, Z5II: Adobe-checked (no camera HE sample to compare).
+    // That is every camera with an HE mode (2026-11).
+    return model == "NIKON Z 8" || model == "NIKON Z 9" || model == "NIKON Z f" || model == "NIKON Z50_2" ||
+           model == "NIKON Z6_3" || model == "NIKON Z5_2" || model == "NIKON ZR";
+}
+
+bool lossless_capable_model(const std::string &model) {
+    static const char *const kModels[] = {
+        "NIKON D3", "NIKON D3S", "NIKON D3X", "NIKON D300", "NIKON D300S", "NIKON D4", "NIKON D4S", "NIKON D5",
+        "NIKON D500", "NIKON D6", "NIKON D600", "NIKON D610", "NIKON D700", "NIKON D7000", "NIKON D7100",
+        "NIKON D7200", "NIKON D750", "NIKON D7500", "NIKON D780", "NIKON D800", "NIKON D800E", "NIKON D810",
+        "NIKON D810A", "NIKON D850", "NIKON Df", "NIKON D5100"};
+    if (model.rfind("NIKON Z", 0) == 0) return true;
+    for (auto *m : kModels) if (model == m) return true;
+    return false;
+}
+
+std::string nef_model(const std::vector<uint8_t> &file) {
+    try {
+        return inspect_nef(file, false).model;
+    } catch (const std::exception &) {
+        return "";
+    }
+}
 
 const char *compression_name(NefCompression c) {
     switch (c) {
@@ -178,15 +205,15 @@ ConvertResult convert_lossless_to_he(const std::vector<uint8_t> &file, const HeE
     // for models that shoot HE in camera (verified: a Z 8 HE file relabelled
     // "NIKON Z 6" is rejected, Z 6 data relabelled "NIKON Z 8" is accepted).
     bool he_model = he_capable_model(model);
-    if (model != "NIKON Z 8") {
+    if (!he_verified_model(model)) {
         if (!allow_untested_model) {
             if (!he_model)
                 throw std::runtime_error("the " + model + " has no HE mode, and raw converters (Adobe, LibRaw) only "
                                          "decode HE for cameras that offer it, so the result would not open");
-            throw std::runtime_error("camera '" + model + "' is untested (HE layout verified for NIKON Z 8 only); "
+            throw std::runtime_error("camera '" + model + "' is untested (HE layout verified for the Z 8, Z 9, Z f, Z6III, Z50II, Z5II and ZR); "
                                      "use --allow-untested to try anyway");
         }
-        res.warnings.push_back(he_model ? "camera '" + model + "' is not a Z 8: output is experimental"
+        res.warnings.push_back(he_model ? "camera '" + model + "' is not a verified HE model: output is experimental"
                                         : "camera '" + model + "' has no HE mode: Adobe/LibRaw will NOT open the output");
     }
     auto *e51 = L.makernote.find(0x51);
@@ -295,21 +322,36 @@ ConvertResult convert_lossless_to_he(const std::vector<uint8_t> &file, const HeE
 
 // Nikon's lossless linearization table (makernote 0x0096), identical on every
 // lossless NEF examined (Z 8 and Z 6): "F0", four 2048 predictor seeds, ...
+// Nikon's lossless "table" (makernote 0x0096) is constant per bit depth. Its
+// first five 16-bit fields follow the makernote byte order; the rest is fixed.
+static const uint8_t kLossless96_12[46] = {
+    0x46, 0x30, 0x00, 0x02, 0x00, 0x02, 0x00, 0x02, 0x00, 0x02, 0x20, 0x00, 0xb7, 0x28, 0xaa, 0x9d,
+    0xe0, 0x72, 0x5e, 0x90, 0x1a, 0xf6, 0x1e, 0x99, 0x65, 0x82, 0xf0, 0xaf, 0xbf, 0x20, 0xd2, 0xd0,
+    0x2d, 0xc8, 0xc7, 0x0c, 0xa1, 0x84, 0xc7, 0x58, 0x2d, 0x50, 0xd3, 0xab, 0x00, 0x00};
 static const uint8_t kLossless96[46] = {
     0x46, 0x30, 0x00, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x08, 0x22, 0x00, 0xb7, 0x2a, 0xaa, 0x9d,
     0xe0, 0x72, 0x5e, 0x91, 0x18, 0xf5, 0x1c, 0x99, 0x65, 0x82, 0xf0, 0xaf, 0xbf, 0x20, 0xd2, 0xd2,
     0x2f, 0xc6, 0xc1, 0x02, 0xa7, 0x86, 0xc5, 0x5a, 0x21, 0x58, 0xd8, 0xa6, 0xca, 0x36};
+
+static std::vector<uint8_t> lossless_table(unsigned bps, bool le) {
+    const uint8_t *t = bps == 12 ? kLossless96_12 : kLossless96;
+    std::vector<uint8_t> v(t, t + 46);
+    if (!le)
+        for (int i = 2; i < 12; i += 2) std::swap(v[i], v[i + 1]);
+    return v;
+}
 
 std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skel_in) {
     Buf b;
     b.d = skel_in;
     NefLayout L = parse_nef(b, false);
     if (!L.have_makernote) throw std::runtime_error("makernote missing; cannot convert to lossless");
-    if (L.bps != 14 || L.compression != 34713)  // the lossless table is verified for 14-bit files
-        throw std::runtime_error("only 14-bit Nikon raw can be converted to lossless");
+    if ((L.bps != 14 && L.bps != 12) || L.compression != 34713)
+        throw std::runtime_error("only 12/14-bit Nikon raw can be converted to lossless");
     const unsigned code = nef_compression_code(b, L);
     if (code == 3) return skel_in;
     const bool mle = L.makernote.le;
+    const std::vector<uint8_t> table = lossless_table(L.bps, mle), table_le = lossless_table(L.bps, true);
     std::vector<uint8_t> tail;  // blocks appended after the old skeleton end
     auto append = [&](const std::vector<uint8_t> &blk) {
         while ((b.d.size() + tail.size()) & 3) tail.push_back(0);
@@ -321,10 +363,10 @@ std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skel_in) {
     // 1. makernote: compression code, size field, lossless table
     if (!set_nef_compression_code(b, L, 3)) throw std::runtime_error("NEF compression tag missing");
     if (auto *e58 = L.makernote.find(0x58); e58 && e58->size() == 12) std::memset(&b.d[e58->value_pos + 4], 0, 8);
-    if (auto *e96 = L.makernote.find(0x96); e96 && e96->size() >= sizeof kLossless96) {
-        std::memcpy(&b.d[e96->value_pos], kLossless96, sizeof kLossless96);   // lossy table slot is larger
-        std::memset(&b.d[e96->value_pos + sizeof kLossless96], 0, e96->size() - sizeof kLossless96);
-        b.w32(e96->entry_pos + 4, uint32_t(sizeof kLossless96), mle);
+    if (auto *e96 = L.makernote.find(0x96); e96 && e96->size() >= table.size()) {
+        std::memcpy(&b.d[e96->value_pos], table.data(), table.size());   // lossy table slot is larger
+        std::memset(&b.d[e96->value_pos + table.size()], 0, e96->size() - table.size());
+        b.w32(e96->entry_pos + 4, uint32_t(table.size()), mle);
     } else {
         // No table (HE, uncompressed): move the makernote to the end of the
         // skeleton and give it a new IFD that includes 0x0096. Makernote
@@ -336,7 +378,7 @@ std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skel_in) {
         const size_t base = 10;  // "Nikon\0" + version, then the TIFF header
         while (blob.size() & 3) blob.push_back(0);
         const uint32_t t96 = uint32_t(blob.size() - base);
-        blob.insert(blob.end(), kLossless96, kLossless96 + sizeof kLossless96);
+        blob.insert(blob.end(), table.begin(), table.end());
         while (blob.size() & 3) blob.push_back(0);
         const uint32_t ifd_rel = uint32_t(blob.size() - base);
         auto p16 = [&](uint16_t v) { blob.push_back(uint8_t(mle ? v : v >> 8)); blob.push_back(uint8_t(mle ? v >> 8 : v)); };
@@ -347,7 +389,7 @@ std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skel_in) {
         {
             std::vector<uint8_t> e96(12);
             Buf t; t.d.assign(12, 0);
-            t.w16(0, 0x96, mle); t.w16(2, 7, mle); t.w32(4, sizeof kLossless96, mle); t.w32(8, t96, mle);
+            t.w16(0, 0x96, mle); t.w16(2, 7, mle); t.w32(4, uint32_t(table.size()), mle); t.w32(8, t96, mle);
             ents.push_back({0x96, t.d});
         }
         std::sort(ents.begin(), ents.end(), [](auto &a, auto &c) { return a.first < c.first; });
@@ -374,7 +416,7 @@ std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skel_in) {
         }
         if (nb.find(0x0d) && !nb.find(0x0e)) {
             std::vector<uint8_t> v{'0', '1', '0', '0'};
-            v.insert(v.end(), kLossless96, kLossless96 + sizeof kLossless96);
+            v.insert(v.end(), table_le.begin(), table_le.end());
             v.resize(v.size() + 2);
             fix_crc(v);
             nb.items.push_back({0x0e, 7, uint32_t(v.size()), v});

@@ -25,6 +25,11 @@ NefInfo inspect_nef(const std::vector<uint8_t> &file, bool check_strip = true);
 // the subset whose HE container layout nefcomp has verified.
 bool he_capable_model(const std::string &model);
 bool he_verified_model(const std::string &model);
+// Cameras that write lossless-compressed NEFs themselves (a restored lossless
+// NEF from any other camera might not be accepted by that camera).
+bool lossless_capable_model(const std::string &model);
+// IFD0 model string of a NEF or skeleton ("" if missing).
+std::string nef_model(const std::vector<uint8_t> &file);
 const char *compression_name(NefCompression c);
 
 struct ConvertResult {

@@ -326,7 +326,6 @@ struct PrecinctCoder {
         result[3] = uint8_t(Q);
         result[4] = uint8_t(R);
         result[11] = 0xc0;  // 25 x Dpb=3 (vertical prediction), 2-bit padding
-        const unsigned sig_bytes = (width / 2 + 255) / 256;
         std::vector<uint8_t> target;
         for (unsigned lb = 0; lb < 8; lb++) {
             sig.clear(); gcli.clear(); data.clear(); sign.clear();
@@ -339,9 +338,11 @@ struct PrecinctCoder {
                 encode_band(bands[sb], gtli, history[prev_band], target, sig, gcli, data, sign, scratch);
                 history[sb] = target;
             }
+            // significance: one bit per 8 coefficient groups of each band, so a line
+            // block holds ceil(sum(ceil(ng / 8)) / 8) bytes. That equals
+            // ceil(width / 2 / 256) for the Z 8 / Z 9 / Z f widths but not e.g. the
+            // Z50II's 5600 (12 bytes in some line blocks, as the camera writes).
             sig.end(); gcli.end(); data.end(); sign.end();
-            if (sig.b.size() > sig_bytes) throw std::runtime_error("significance layout exceeds typed width");
-            sig.b.resize(sig_bytes, 0);
             if (data.b.size() >= 1u << 20 || gcli.b.size() >= 1u << 20 || sign.b.size() >= 1u << 15)
                 throw std::runtime_error("substream length overflow");
             uint64_t mini = (uint64_t(data.b.size()) << 35) | (uint64_t(gcli.b.size()) << 15) | sign.b.size();

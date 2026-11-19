@@ -265,6 +265,10 @@ RenderParams render_params(const Tiff &t, TNode &ifd0, TNode &raw) {
     auto has = [](TNode &n, uint16_t k) { return n.tags.count(k) > 0; };
     if (has(raw, 0xc61a)) { auto v = t.reals(raw.tags[0xc61a]); double s = 0; for (double x : v) s += x; rp.black = s / v.size(); }
     if (has(raw, 0xc61d)) rp.white = t.reals(raw.tags[0xc61d]).at(0);
+    if (has(raw, 0xc618)) {  // 16-bit scale DNG (see jxl_dng_decode): levels in nefcomp's 14-bit units
+        auto lut = t.ints(raw.tags[0xc618]);
+        if (!lut.empty() && *std::max_element(lut.begin(), lut.end()) > 16383) { rp.black /= 4; rp.white /= 4; }
+    }
     if (has(ifd0, 0xc628)) { auto v = t.reals(ifd0.tags[0xc628]); for (int i = 0; i < 3 && i < int(v.size()); i++) rp.neutral[i] = v[i]; }
     uint16_t fm = has(ifd0, 0xc715) ? 0xc715 : has(ifd0, 0xc714) ? 0xc714 : 0;  // prefer the D65 matrix
     if (fm) { auto v = t.reals(ifd0.tags[fm]); if (v.size() == 9) std::copy(v.begin(), v.end(), rp.fm); }
@@ -300,6 +304,8 @@ std::vector<uint16_t> decode_jxl_raw(const Tiff &t, TNode &raw, unsigned threads
     if (!((rif == 2 && cif == 2) || (rif == 1 && cif == 1))) throw std::runtime_error("unsupported interleave");
     std::vector<uint16_t> lut;
     if (raw.tags.count(0xc618)) for (uint32_t v : t.ints(raw.tags[0xc618])) lut.push_back(uint16_t(v));
+    // nefcomp's tables top out at 16383, or 4 x that for files Adobe keeps at 16-bit scale
+    const unsigned shift = !lut.empty() && *std::max_element(lut.begin(), lut.end()) > 16383 ? 2 : 0;
     const unsigned h2 = H / 2, w2 = W / 2;
     std::vector<uint16_t> px(size_t(W) * H);
     for (unsigned y = 0; y < H; y++)
@@ -307,7 +313,7 @@ std::vector<uint16_t> decode_jxl_raw(const Tiff &t, TNode &raw, unsigned threads
             unsigned sy = rif == 2 ? (y & 1) * h2 + y / 2 : y, sx = cif == 2 ? (x & 1) * w2 + x / 2 : x;
             uint16_t c = stored[size_t(sy) * W + sx];
             uint16_t v = lut.empty() ? c : lut[std::min<size_t>(c, lut.size() - 1)];
-            px[size_t(y) * W + x] = std::min<uint16_t>(v, 16383);
+            px[size_t(y) * W + x] = std::min<uint16_t>(uint16_t(v >> shift), 16383);
         }
     return px;
 }
@@ -373,8 +379,8 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     // lossy NEFs Adobe keeps the raw codes plus its curve (LinearizationTable);
     // we take the linear values from Adobe's curve, so the DNG shows exactly
     // what Camera Raw shows for the original NEF, and keep that curve.
-    std::vector<uint16_t> lossy_curve;
-    unsigned cx = 0, cy = 0;
+    std::vector<uint16_t> lossy_curve, lossy_codes;
+    unsigned cx = 0, cy = 0, scale_shift = 0;
     {
         std::vector<uint8_t> data;
         for (auto &blk : raw.blocks.at(0x111)) data.insert(data.end(), blk.begin(), blk.end());
@@ -385,13 +391,19 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
         std::vector<uint16_t> ref = px;  // what Adobe stores: linear values, or raw codes for lossy NEFs
         if (info.format == RawFormat::Lossy) {
             std::vector<uint16_t> nikon_curve, adobe_lut;
-            decode_raw_codes(nef, ref, nikon_curve);
+            decode_raw_codes(nef, lossy_codes, nikon_curve);  // int16 codes (may leave the curve after a split)
             if (!raw.tags.count(0xc618)) throw std::runtime_error("Adobe's DNG of a lossy NEF has no linearization table");
             for (uint32_t v : t.ints(raw.tags[0xc618])) adobe_lut.push_back(uint16_t(v));
-            if (adobe_lut.size() < nikon_curve.size()) throw std::runtime_error("Adobe's linearization table is too short");
-            for (size_t i = 0; i < px.size(); i++) px[i] = std::min<uint16_t>(adobe_lut[ref[i]], 16383);
-            lossy_curve.assign(adobe_lut.begin(), adobe_lut.begin() + nikon_curve.size());
-            for (auto &v : lossy_curve) v = std::min<uint16_t>(v, 16383);
+            if (adobe_lut.empty()) throw std::runtime_error("Adobe's linearization table is empty");
+            // Adobe stores codes clamped like LibRaw; its table covers the codes it stores
+            lossy_curve.resize(std::min<size_t>(std::max(nikon_curve.size(), adobe_lut.size()), 0x4000));
+            for (size_t i = 0; i < lossy_curve.size(); i++)
+                lossy_curve[i] = std::min<uint16_t>(adobe_lut[std::min(i, adobe_lut.size() - 1)], 16383);
+            for (size_t i = 0; i < px.size(); i++) {
+                int c = std::clamp<int>(int16_t(lossy_codes[i]), 0, 0x3fff);
+                ref[i] = uint16_t(c);
+                px[i] = lossy_curve[std::min<size_t>(c, lossy_curve.size() - 1)];
+            }
         }
         auto matches = [&](unsigned x0, unsigned y0, unsigned rows) {
             for (unsigned y = 0; y < rows; y++)
@@ -400,20 +412,31 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
             return true;
         };
         bool found = false;
-        for (unsigned y0 = 0; y0 <= NH - DH && !found; y0++)
-            for (unsigned x0 = 0; x0 <= NW - DW && !found; x0++)
-                if (matches(x0, y0, std::min(DH, 8u)) && matches(x0, y0, DH)) { cx = x0; cy = y0; found = true; }
+        for (int pass = 0; pass < 2 && !found; pass++) {
+            if (pass == 1) {  // Adobe keeps 16-bit words where nefcomp uses word >> 2 (Coolpix P7700, ...)
+                if (info.format != RawFormat::Uncompressed || info.layout != UncompLayout::Unpacked16Shift4) break;
+                for (auto &v : ref) v = uint16_t(v << 2);
+                scale_shift = 2;
+            }
+            for (unsigned y0 = 0; y0 <= NH - DH && !found; y0++)
+                for (unsigned x0 = 0; x0 <= NW - DW && !found; x0++)
+                    if (matches(x0, y0, std::min(DH, 8u)) && matches(x0, y0, DH)) { cx = x0; cy = y0; found = true; }
+        }
         if (!found) throw std::runtime_error("Adobe's raw data differs from nefcomp's decode");
     }
+    // the Bayer plane split needs even sizes: an odd Adobe crop (e.g. D80, 2611
+    // rows) takes one more NEF row/column, and an ActiveArea keeps Adobe's region
+    const unsigned EW = DW + (DW & 1), EH = DH + (DH & 1);
+    if (cx + EW > NW || cy + EH > NH) throw std::runtime_error("odd raw dimensions");
+    const bool extended = EW != DW || EH != DH;
     std::vector<uint16_t> px_full = px;
-    if (DW != NW || DH != NH) {  // the DNG holds the cropped region
-        std::vector<uint16_t> crop(size_t(DW) * DH);
-        for (unsigned y = 0; y < DH; y++)
-            std::copy_n(&px_full[size_t(y + cy) * NW + cx], DW, &crop[size_t(y) * DW]);
+    if (EW != NW || EH != NH) {  // the DNG holds the cropped region
+        std::vector<uint16_t> crop(size_t(EW) * EH);
+        for (unsigned y = 0; y < EH; y++)
+            std::copy_n(&px_full[size_t(y + cy) * NW + cx], EW, &crop[size_t(y) * EW]);
         px = std::move(crop);
     }
-    W = DW; H = DH;
-    if ((W | H) & 1) throw std::runtime_error("odd raw dimensions");
+    W = EW; H = EH;
     res.width = W; res.height = H;
 
     // black level for the companding curve: Adobe's (e.g. 0 for older bodies)
@@ -422,7 +445,7 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
         auto v = t.reals(raw.tags[0xc61a]);
         double sum = 0;
         for (double x : v) sum += x;
-        if (!v.empty()) black = unsigned(std::lround(sum / v.size()));
+        if (!v.empty()) black = unsigned(std::lround(sum / v.size())) >> scale_shift;
     }
 
     // 2. companding + Bayer plane interleave
@@ -501,6 +524,11 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     raw.tags[0x103] = shorts(kJxlCompression);
     raw.tags[0x142] = w.longs({T});
     raw.tags[0x143] = w.longs({T});
+    if (extended) {
+        raw.tags[0x100] = w.longs({W});
+        raw.tags[0x101] = w.longs({H});
+        if (!raw.tags.count(0xc68d)) raw.tags[0xc68d] = w.longs({0, 0, DH, DW});  // ActiveArea: top, left, bottom, right
+    }
     raw.tags[0xc71f] = shorts(2);   // RowInterleaveFactor
     raw.tags[0xcd43] = shorts(2);   // ColumnInterleaveFactor
     {
@@ -514,7 +542,7 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     raw.tags[0xcd45] = w.longs({uint32_t(o.effort)});  // JXLEffort
     {
         TEntry lt{3, 65536, {}};
-        for (uint16_t v : tr) w.p16(lt.data, v);
+        for (uint16_t v : tr) w.p16(lt.data, uint16_t(v << scale_shift));  // Adobe's value scale
         raw.tags[0xc618] = lt;      // LinearizationTable
     }
     {
@@ -532,7 +560,8 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     EmbedStats es;
     RawCrop crop{cx, cy, W, H};
     auto blob = embed_build(nef, px_full, mn, o.keep_previews, &es, lossy_curve.empty() ? nullptr : &lossy_curve,
-                            (W != NW || H != NH) ? &crop : nullptr);
+                            (W != NW || H != NH) ? &crop : nullptr, lossy_codes.empty() ? nullptr : &lossy_codes,
+                            o.lossless);
     res.skeleton_bytes = blob.size();
     res.previews_dropped = es.previews_dropped;
     res.previews_kept_bytes = es.previews_kept;
