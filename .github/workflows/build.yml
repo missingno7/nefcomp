@@ -52,7 +52,7 @@ jobs:
         run: |
           if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="$(git describe --tags --always)-ci"; fi
           echo "VERSION=$v" >> "$GITHUB_ENV"
-      - run: brew install ninja nasm
+      - run: brew install ninja nasm && cmake --version && xcrun --show-sdk-path && clang --version
       - uses: actions/cache@v4
         with:
           path: .deps
@@ -60,7 +60,8 @@ jobs:
       - name: dependencies for arm64 and x86_64
         run: |
           for arch in arm64 x86_64; do
-            export CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$arch -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0" BUILD_DIR="build-$arch"
+            # CMake 4 no longer picks the SDK by itself: without a sysroot its test compiles fail
+            export CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$arch -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_OSX_SYSROOT=$(xcrun --show-sdk-path)" BUILD_DIR="build-$arch"
             [ -f ".deps/jxl-$arch/lib/libjxl.a" ] || CC=clang CXX=clang++ sh third_party/build_libjxl.sh "$PWD/.work/jxl" "$PWD/.deps/jxl-$arch"
             [ -f ".deps/jpeg-$arch/lib/libjpeg.a" ] || CC=clang sh third_party/build_libjpeg.sh "$PWD/.work/jpeg" "$PWD/.deps/jpeg-$arch"
           done
