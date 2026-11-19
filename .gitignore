@@ -1,0 +1,15 @@
+# Personal / proprietary inputs and generated outputs: never commit
+/examples/
+/assets/
+/out/
+
+# Build artifacts
+*.exe
+*.o
+*.part
+
+# Analysis scratch files
+*.u16
+*.jxs
+__pycache__/
+*.pyc

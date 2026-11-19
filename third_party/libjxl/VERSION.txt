@@ -1,0 +1,1 @@
+libjxl v0.11.1 (794a5dcf), static MinGW-w64 g++ 12 build: encoder+decoder with JPEG transcoding, bundled highway/brotli/skcms

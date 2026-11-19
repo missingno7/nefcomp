@@ -1,0 +1,30 @@
+// Nikon lossless-compressed NEF decoder (14/12-bit, "F0"/"D" variants).
+// Written from the publicly documented format (dcraw / LibRaw nikon_load_raw).
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+#include <string>
+
+namespace nefcomp {
+
+// meta: contents of makernote tag 0x0096 (NEFLinearizationTable).
+// meta_le: true if the makernote is little-endian ("II").
+// Returns false (and sets err) on malformed input.
+bool decode_nikon_lossless(const uint8_t *strip, size_t strip_len,
+                           const uint8_t *meta, size_t meta_len, bool meta_le,
+                           unsigned width, unsigned height, unsigned bps,
+                           std::vector<uint16_t> &out, std::string &err);
+
+// Encode samples as a Nikon lossless (F0) strip using the predictor seeds in
+// `meta` (makernote 0x0096). Inverse of decode_nikon_lossless.
+bool encode_nikon_lossless(const uint16_t *px, unsigned width, unsigned height, unsigned bps,
+                           const uint8_t *meta, size_t meta_len, bool meta_le,
+                           std::vector<uint8_t> &out, std::string &err);
+
+// Nikon uncompressed 14-bit: 4 samples in 7 bytes (LSB first), rows padded to 16 bytes.
+size_t nikon_packed14_stride(unsigned width);
+void decode_nikon_packed14(const uint8_t *src, unsigned width, unsigned height, std::vector<uint16_t> &out);
+std::vector<uint8_t> encode_nikon_packed14(const uint16_t *px, unsigned width, unsigned height);
+
+} // namespace nefcomp
