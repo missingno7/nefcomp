@@ -13,3 +13,12 @@
 *.jxs
 __pycache__/
 *.pyc
+
+# Raw/image files anywhere (outputs like dn_out/ must never be committed)
+*.nef
+*.NEF
+*.dng
+*.DNG
+*.jpg
+*.JPG
+*.png

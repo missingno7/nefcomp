@@ -11,7 +11,7 @@ Shrinks Nikon NEF raw files after shooting:
 nefcomp [options] <file.NEF | dir> ...          lossless NEF -> HE / HE* NEF; HE* -> HE (-m he)
 nefcomp --dng [options] <file.NEF | dir> ...    NEF -> JPEG XL raw DNG (restorable)
 nefcomp --auto [options] <file.NEF | dir> ...   per file: HE NEF where possible, DNG otherwise
-nefcomp restore [options] <file.dng | dir> ...  DNG made by --dng -> NEF in its original format
+nefcomp restore [options] <file.dng | dir> ...  DNG made by --dng -> genuine Nikon NEF (lossless by default)
 nefcomp info <file.NEF> ...
 
   -r, --recursive        include subfolders (with -o, the folder structure is mirrored)
@@ -32,6 +32,7 @@ nefcomp info <file.NEF> ...
       --verify           report the error against the original samples
       --overwrite        replace existing outputs (default: skip them)
       --force            write a DNG even if it is not smaller than the original NEF
+      --as FORMAT        restore: lossless (default) | original
       --allow-untested   allow HE NEF output for cameras other than the Z 8
   -j, --threads N        encoder threads
 ```
@@ -50,15 +51,21 @@ nefcomp restore -r -o D:\Photos\back E:\Archive
 Pass folders and/or files; `-r` includes subfolders. nefcomp first **plans** every file, then runs
 the plan:
 
-| mode | lossless NEF, HE camera (Z 8) | lossless / uncompressed NEF, other camera | HE★ NEF | HE NEF | lossy NEF |
+| mode | lossless NEF, HE camera (Z 8) | lossless / uncompressed / lossy NEF, other camera | HE★ NEF | HE NEF | |
 | --- | --- | --- | --- | --- | --- |
-| default (`-m hestar`) | HE★ NEF | skip (hint: `--auto` / `--dng`) | skip | skip (HE★ would be larger) | skip |
-| `-m he` | HE NEF | skip | **HE NEF** (re-encoded) | skip | skip |
-| `--dng` | DNG | DNG | DNG | DNG | skip |
-| `--auto` | HE★ NEF (HE with `-m he`) | DNG | skip (HE with `-m he`) | skip | skip |
+| default (`-m hestar`) | HE★ NEF | skip (hint: `--auto` / `--dng`) | skip | skip (HE★ would be larger) | |
+| `-m he` | HE NEF | skip | **HE NEF** (re-encoded) | skip | |
+| `--dng` | DNG | DNG | DNG | DNG | |
+| `--auto` | HE★ NEF (HE with `-m he`) | DNG | skip (HE with `-m he`) | skip | |
 
 * **Not smaller:** a DNG that would not be smaller than its NEF (e.g. an HE file at the default q70)
   is skipped with its sizes shown. Lower `-q` / `--bpp`, or use `--force` to write it anyway.
+* **Lossy NEFs** (Nikon "Compressed", e.g. Z 6 DSC_1207) go to DNG. nefcomp decodes the raw codes
+  and uses Adobe's own curve for the linear values, so the DNG matches what Camera Raw shows for
+  the NEF. The curve is stored in the embedded data. `restore` maps pixels to the nearest code (adding
+  ~1.1 DN rms) and re-encodes with Nikon's lossy Huffman tree. The encoder reproduces the camera
+  file byte-for-byte, and `-m lossless --keep-previews` restores it byte-identically. DSC_1207:
+  25.7 MB → 13.7 MB at `-q 70`, 6.1 MB at `-q 45`.
 * **HE★ → HE:** the HE★ data is decoded and re-encoded at 3 bpp, a second lossy generation (rms 9–18 DN
   over the HE★ pixels on the samples). The container is patched like a camera HE file; Adobe decodes
   it bit-identically.
@@ -187,8 +194,17 @@ nefcomp refuses such models and points to `--dng`.
    which NX Studio browsing, Windows thumbnails and the camera's playback show. Raw data and all
    metadata are unaffected. v1 DNGs are still restorable.
 
-`nefcomp restore` decodes the tiles and re-encodes them in the NEF's original raw format (lossless,
-uncompressed or HE), then reattaches the skeleton. Nikon's lossless encoder is reproduced exactly:
+`nefcomp restore` decodes the tiles and writes a **lossless NEF** by default, whatever the original
+format was (HE★, HE, lossy, uncompressed). That's the failsafe: no loss beyond what the DNG already
+has, and the file can be edited in camera and opened in NX Studio. The container gets the camera's
+lossless metadata (mode 3, zeroed size fields, Nikon's lossless table in makernote 0x0096 and
+0xC7D5/0x000E, which is identical on every Z 8 / Z 6 lossless file examined). Where the table has to be
+added, the makernote is moved to the end of the metadata (its offsets are self-relative), with a new
+IFD. Restored lossless NEFs from HE★, HE, lossy and uncompressed sources have the same tag structure as
+a camera lossless file, raw data identical to the DNG, and Adobe decodes them identically.
+`--as original` re-encodes in the original format instead (smaller, but another lossy pass for
+HE/lossy sources). It is the mode that gives byte-identical files from `-m lossless --keep-previews`
+DNGs of non-lossless originals; lossless originals come back byte-identical in either mode. Nikon's lossless encoder is reproduced exactly:
 decoding and re-encoding gives a byte-identical file for every sample NEF (the camera pads the
 last byte with 1-bits). Results:
 

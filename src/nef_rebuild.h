@@ -8,7 +8,7 @@
 
 namespace nefcomp {
 
-enum class RawFormat { Lossless, Packed14, HE, HEStar, Unsupported };
+enum class RawFormat { Lossless, Lossy, Packed14, HE, HEStar, Unsupported };
 
 struct NefRaw {
     RawFormat format = RawFormat::Unsupported;
@@ -25,8 +25,14 @@ std::vector<uint16_t> decode_raw(const std::vector<uint8_t> &file, NefRaw *info 
 // Skeleton = file bytes before the raw strip (the strip must be last).
 std::vector<uint8_t> nef_skeleton(const std::vector<uint8_t> &file);
 
+// Lossy NEF: raw codes and the code -> value curve (Nikon's, as LibRaw interpolates it).
+void decode_raw_codes(const std::vector<uint8_t> &file, std::vector<uint16_t> &codes, std::vector<uint16_t> &curve);
+
 // Re-encode `pixels` in the skeleton's original format and append it.
+// For lossy NEFs each pixel is mapped to the nearest code of `lossy_curve`
+// (default: the curve from the skeleton's makernote).
 // The result is verified by decoding it again (bit-exact for lossless/packed).
-std::vector<uint8_t> nef_assemble(const std::vector<uint8_t> &skeleton, const std::vector<uint16_t> &pixels);
+std::vector<uint8_t> nef_assemble(const std::vector<uint8_t> &skeleton, const std::vector<uint16_t> &pixels,
+                                  const std::vector<uint16_t> *lossy_curve = nullptr);
 
 } // namespace nefcomp

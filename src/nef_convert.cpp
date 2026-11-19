@@ -294,4 +294,112 @@ ConvertResult convert_lossless_to_he(const std::vector<uint8_t> &file, const HeE
     return res;
 }
 
+// Nikon's lossless linearization table (makernote 0x0096), identical on every
+// lossless NEF examined (Z 8 and Z 6): "F0", four 2048 predictor seeds, ...
+static const uint8_t kLossless96[46] = {
+    0x46, 0x30, 0x00, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x08, 0x22, 0x00, 0xb7, 0x2a, 0xaa, 0x9d,
+    0xe0, 0x72, 0x5e, 0x91, 0x18, 0xf5, 0x1c, 0x99, 0x65, 0x82, 0xf0, 0xaf, 0xbf, 0x20, 0xd2, 0xd2,
+    0x2f, 0xc6, 0xc1, 0x02, 0xa7, 0x86, 0xc5, 0x5a, 0x21, 0x58, 0xd8, 0xa6, 0xca, 0x36};
+
+std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skel_in) {
+    Buf b;
+    b.d = skel_in;
+    NefLayout L = parse_nef(b, false);
+    if (!L.have_makernote) throw std::runtime_error("makernote missing; cannot convert to lossless");
+    if (L.bps != 14 || L.compression != 34713) throw std::runtime_error("only 14-bit Nikon raw can be converted to lossless");
+    auto *e51 = L.makernote.find(0x51);
+    if (!e51 || e51->size() < 11) throw std::runtime_error("makernote tag 0x51 missing");
+    const unsigned code = b.d[e51->value_pos + 10];
+    if (code == 3) return skel_in;
+    const bool mle = L.makernote.le;
+    std::vector<uint8_t> tail;  // blocks appended after the old skeleton end
+    auto append = [&](const std::vector<uint8_t> &blk) {
+        while ((b.d.size() + tail.size()) & 3) tail.push_back(0);
+        size_t pos = b.d.size() + tail.size();
+        tail.insert(tail.end(), blk.begin(), blk.end());
+        return pos;
+    };
+
+    // 1. makernote: compression code, size field, lossless table
+    b.d[e51->value_pos + 10] = 3;
+    if (auto *e58 = L.makernote.find(0x58); e58 && e58->size() == 12) std::memset(&b.d[e58->value_pos + 4], 0, 8);
+    if (auto *e96 = L.makernote.find(0x96); e96 && e96->size() >= sizeof kLossless96) {
+        std::memcpy(&b.d[e96->value_pos], kLossless96, sizeof kLossless96);   // lossy table slot is larger
+        std::memset(&b.d[e96->value_pos + sizeof kLossless96], 0, e96->size() - sizeof kLossless96);
+        b.w32(e96->entry_pos + 4, uint32_t(sizeof kLossless96), mle);
+    } else {
+        // No table (HE, uncompressed): move the makernote to the end of the
+        // skeleton and give it a new IFD that includes 0x0096. Makernote
+        // offsets are relative to its own header, so its data stays valid.
+        auto *mn = L.exif.find(0x927c);
+        if (!mn) throw std::runtime_error("makernote entry missing");
+        const size_t mpos = mn->value_pos, mlen = mn->size();
+        std::vector<uint8_t> blob(b.d.begin() + mpos, b.d.begin() + mpos + mlen);
+        const size_t base = 10;  // "Nikon\0" + version, then the TIFF header
+        while (blob.size() & 3) blob.push_back(0);
+        const uint32_t t96 = uint32_t(blob.size() - base);
+        blob.insert(blob.end(), kLossless96, kLossless96 + sizeof kLossless96);
+        while (blob.size() & 3) blob.push_back(0);
+        const uint32_t ifd_rel = uint32_t(blob.size() - base);
+        auto p16 = [&](uint16_t v) { blob.push_back(uint8_t(mle ? v : v >> 8)); blob.push_back(uint8_t(mle ? v >> 8 : v)); };
+        auto p32 = [&](uint32_t v) { for (int i = 0; i < 4; i++) blob.push_back(uint8_t(v >> (mle ? 8 * i : 24 - 8 * i))); };
+        std::vector<std::pair<uint16_t, std::vector<uint8_t>>> ents;
+        for (auto &e : L.makernote.entries)
+            ents.push_back({e.tag, std::vector<uint8_t>(b.d.begin() + e.entry_pos, b.d.begin() + e.entry_pos + 12)});
+        {
+            std::vector<uint8_t> e96(12);
+            Buf t; t.d.assign(12, 0);
+            t.w16(0, 0x96, mle); t.w16(2, 7, mle); t.w32(4, sizeof kLossless96, mle); t.w32(8, t96, mle);
+            ents.push_back({0x96, t.d});
+        }
+        std::sort(ents.begin(), ents.end(), [](auto &a, auto &c) { return a.first < c.first; });
+        p16(uint16_t(ents.size()));
+        for (auto &e : ents) blob.insert(blob.end(), e.second.begin(), e.second.end());
+        p32(b.u32(L.makernote.pos + 2 + 12 * L.makernote.entries.size(), mle));  // next IFD
+        Buf hb; hb.d = blob;
+        hb.w32(base + 4, ifd_rel, mle);
+        blob = std::move(hb.d);
+        std::memset(&b.d[mpos], 0, mlen);
+        size_t npos = append(blob);
+        b.w32(mn->entry_pos + 4, uint32_t(blob.size()), L.exif.le);
+        b.w32(mn->entry_pos + 8, uint32_t(npos), L.exif.le);
+    }
+
+    // 2. raw IFD 0xC7D5: mode 3, size zero, lossless table copy 0x000E
+    if (auto *c7 = L.raw_ifd.find(0xc7d5)) {
+        NikonBlock nb = NikonBlock::parse(b, c7->value_pos, c7->size());
+        if (auto *m = nb.find(0x0d); m && m->data.size() == 8 && crc_ok(m->data)) {
+            m->data[4] = 3; m->data[5] = 0; fix_crc(m->data);
+        }
+        if (auto *m = nb.find(0x0f); m && m->data.size() == 14 && crc_ok(m->data)) {
+            std::memset(&m->data[4], 0, 8); fix_crc(m->data);
+        }
+        if (nb.find(0x0d) && !nb.find(0x0e)) {
+            std::vector<uint8_t> v{'0', '1', '0', '0'};
+            v.insert(v.end(), kLossless96, kLossless96 + sizeof kLossless96);
+            v.resize(v.size() + 2);
+            fix_crc(v);
+            nb.items.push_back({0x0e, 7, uint32_t(v.size()), v});
+            std::sort(nb.items.begin(), nb.items.end(), [](auto &a, auto &c) { return a.tag < c.tag; });
+        }
+        std::vector<uint8_t> blk = nb.serialize();
+        if (blk.size() <= c7->size()) {
+            std::memcpy(&b.d[c7->value_pos], blk.data(), blk.size());
+            std::memset(&b.d[c7->value_pos + blk.size()], 0, c7->size() - blk.size());
+            b.w32(c7->entry_pos + 4, uint32_t(blk.size()), L.raw_ifd.le);
+        } else {
+            std::memset(&b.d[c7->value_pos], 0, c7->size());
+            size_t npos = append(blk);
+            b.w32(c7->entry_pos + 4, uint32_t(blk.size()), L.raw_ifd.le);
+            b.w32(c7->entry_pos + 8, uint32_t(npos), L.raw_ifd.le);
+        }
+    }
+
+    // 3. new skeleton end = raw strip offset (512-aligned like the camera)
+    b.d.insert(b.d.end(), tail.begin(), tail.end());
+    while (b.d.size() % 512) b.d.push_back(0);
+    b.w32(L.raw_ifd.find(0x111)->value_pos, uint32_t(b.d.size()), L.raw_ifd.le);
+    return std::move(b.d);
+}
+
 } // namespace nefcomp

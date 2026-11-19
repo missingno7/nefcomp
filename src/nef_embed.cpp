@@ -17,8 +17,10 @@
 //   4 12-bit packed image (Nikon helper images), lossless JPEG XL of its planes
 //   5 6-bit packed CFA image (Z 6 helper image), lossless JPEG XL of its planes
 //   6 JPEG preview kept: lossless JPEG recompression (bit-exact)
+//   7 lossy-NEF curve (code -> 14-bit value) used for the raw data, uint16 LE, brotli
 
 #include "nef_embed.h"
+#include "nef_convert.h"
 #include "hash.h"
 #include "jxl_util.h"
 #include "nef_rebuild.h"
@@ -37,7 +39,7 @@ namespace nefcomp {
 namespace {
 
 constexpr char kMagic[12] = {'N', 'E', 'F', 'C', 'O', 'M', 'P', '-', 'S', 'K', 'E', 'L'};
-enum Kind : uint8_t { kJpegRegen = 1, kRgbRegen = 2, kMakernote = 3, kPack12 = 4, kPack6 = 5, kJpegKept = 6 };
+enum Kind : uint8_t { kJpegRegen = 1, kRgbRegen = 2, kMakernote = 3, kPack12 = 4, kPack6 = 5, kJpegKept = 6, kLossyCurve = 7 };
 
 struct Record {
     uint8_t kind = 0;
@@ -201,7 +203,8 @@ std::vector<uint8_t> dng_private_makernote(const std::vector<uint8_t> &pd) {
 }
 
 std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vector<uint16_t> &px,
-                                 const std::vector<uint8_t> &dng_mn, bool keep_previews, EmbedStats *st) {
+                                 const std::vector<uint8_t> &dng_mn, bool keep_previews, EmbedStats *st,
+                                 const std::vector<uint16_t> *lossy_curve) {
     EmbedStats s;
     Buf b;
     b.d = nef;
@@ -292,6 +295,15 @@ std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vec
         }
     }
 
+    if (lossy_curve && !lossy_curve->empty()) {
+        Record r;
+        r.kind = kLossyCurve;
+        r.w = uint32_t(lossy_curve->size());
+        std::vector<uint8_t> raw(lossy_curve->size() * 2);
+        for (size_t i = 0; i < lossy_curve->size(); i++) { raw[2 * i] = uint8_t((*lossy_curve)[i]); raw[2 * i + 1] = uint8_t((*lossy_curve)[i] >> 8); }
+        r.payload = brotli_compress(raw.data(), raw.size());
+        recs.push_back(std::move(r));
+    }
     auto rz = brotli_compress(resid.data(), resid.size());
     Writer w;
     w.bytes(reinterpret_cast<const uint8_t *>(kMagic), 12);
@@ -315,7 +327,8 @@ std::vector<uint8_t> embed_build(const std::vector<uint8_t> &nef, const std::vec
 }
 
 std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::vector<uint16_t> &px,
-                                   const std::vector<uint8_t> &dng_mn, const RenderParams &rp, EmbedRestore *info) {
+                                   const std::vector<uint8_t> &dng_mn, const RenderParams &rp, EmbedRestore *info,
+                                   bool to_lossless) {
     EmbedRestore ri;
     Reader rd{blob.data(), blob.data() + blob.size()};
     if (std::memcmp(rd.take(12), kMagic, 12) != 0) throw std::runtime_error("unknown embedded NEF format");
@@ -324,6 +337,7 @@ std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::
     const uint8_t *fh = rd.take(32), *ph = rd.take(32);
     ri.pixels_exact = std::memcmp(sha_px(px).data(), ph, 32) == 0;
     std::vector<uint8_t> skel;
+    std::vector<uint16_t> lossy_curve;
     if (ver == 1) {
         skel = zdecompress(rd.p, size_t(rd.end - rd.p));
     } else if (ver == 2) {
@@ -340,6 +354,13 @@ std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::
             const uint8_t *p = rd.take(size_t(pl));
             r.payload.assign(p, p + pl);
             if (r.off + r.len > skel.size()) throw std::runtime_error("embedded record out of range");
+            if (r.kind == kLossyCurve) {
+                std::vector<uint8_t> raw;
+                if (!brotli_decompress(r.payload.data(), r.payload.size(), size_t(r.w) * 2, raw))
+                    throw std::runtime_error("corrupt embedded lossy curve");
+                lossy_curve.resize(r.w);
+                for (size_t i = 0; i < r.w; i++) lossy_curve[i] = uint16_t(raw[2 * i] | raw[2 * i + 1] << 8);
+            }
         }
         // data records first (makernote, helper images, kept previews), previews last
         for (auto &r : recs) {
@@ -383,7 +404,20 @@ std::vector<uint8_t> embed_restore(const std::vector<uint8_t> &blob, const std::
     } else {
         throw std::runtime_error("unsupported embedded NEF version " + std::to_string(ver));
     }
-    std::vector<uint8_t> nef = nef_assemble(skel, px);
+    switch (describe_raw(skel, false).format) {
+    case RawFormat::Lossless: ri.original_format = "lossless"; break;
+    case RawFormat::Lossy: ri.original_format = "lossy compressed"; break;
+    case RawFormat::Packed14: ri.original_format = "uncompressed"; break;
+    case RawFormat::HE: ri.original_format = "High Efficiency"; break;
+    case RawFormat::HEStar: ri.original_format = "High Efficiency*"; break;
+    default: ri.original_format = "unknown";
+    }
+    if (to_lossless && describe_raw(skel, false).format != RawFormat::Lossless) {
+        skel = skeleton_to_lossless(skel);
+        lossy_curve.clear();
+        ri.converted_to_lossless = true;
+    }
+    std::vector<uint8_t> nef = nef_assemble(skel, px, lossy_curve.empty() ? nullptr : &lossy_curve);
     ri.file_exact = std::memcmp(sha256(nef.data(), nef.size()).data(), fh, 32) == 0;
     if (info) *info = ri;
     return nef;

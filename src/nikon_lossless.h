@@ -16,6 +16,16 @@ bool decode_nikon_lossless(const uint8_t *strip, size_t strip_len,
                            unsigned width, unsigned height, unsigned bps,
                            std::vector<uint16_t> &out, std::string &err);
 
+// Lossy NEFs (makernote 0x96 version 0x44): decode the raw codes (before the
+// curve) plus the curve that maps code -> 14-bit value; encode codes back.
+bool decode_nikon_codes(const uint8_t *strip, size_t strip_len, const uint8_t *meta, size_t meta_len, bool meta_le,
+                        unsigned width, unsigned height, unsigned bps, std::vector<uint16_t> &codes,
+                        std::vector<uint16_t> &curve, std::string &err);
+bool nikon_lossy_curve(const uint8_t *meta, size_t meta_len, bool meta_le, unsigned bps, std::vector<uint16_t> &curve,
+                       std::string &err);
+bool encode_nikon_lossy(const uint16_t *codes, unsigned width, unsigned height, unsigned bps, const uint8_t *meta,
+                        size_t meta_len, bool meta_le, std::vector<uint8_t> &out, std::string &err);
+
 // Encode samples as a Nikon lossless (F0) strip using the predictor seeds in
 // `meta` (makernote 0x0096). Inverse of decode_nikon_lossless.
 bool encode_nikon_lossless(const uint16_t *px, unsigned width, unsigned height, unsigned bps,

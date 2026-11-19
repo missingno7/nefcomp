@@ -1,5 +1,6 @@
 #include "nikon_lossless.h"
 #include <algorithm>
+#include <cstring>
 
 namespace nefcomp {
 
@@ -49,10 +50,16 @@ struct BitReader {
 inline unsigned rd16(const uint8_t *p, bool le) { return le ? p[0] | (p[1] << 8) : (p[0] << 8) | p[1]; }
 } // namespace
 
-bool decode_nikon_lossless(const uint8_t *strip, size_t strip_len,
-                           const uint8_t *meta, size_t meta_len, bool le,
-                           unsigned width, unsigned height, unsigned bps,
-                           std::vector<uint16_t> &out, std::string &err) {
+struct NefMeta {
+    int tree = 0;
+    uint16_t vpred[2][2] = {{0, 0}, {0, 0}};
+    std::vector<uint16_t> curve;
+    unsigned maxv = 0, split = 0;
+    bool lossy = false;
+};
+
+// Parse makernote 0x0096 (version, predictor seeds, curve) like dcraw/LibRaw.
+static bool parse_meta(const uint8_t *meta, size_t meta_len, bool le, unsigned bps, NefMeta &m, std::string &err) {
     if (meta_len < 12) { err = "linearization table too short"; return false; }
     unsigned ver0 = meta[0], ver1 = meta[1];
     size_t mp = 2;
@@ -63,6 +70,7 @@ bool decode_nikon_lossless(const uint8_t *strip, size_t strip_len,
     if (mp + 10 > meta_len) { err = "linearization table too short"; return false; }
     uint16_t vpred[2][2] = {{uint16_t(rd16(meta + mp, le)), uint16_t(rd16(meta + mp + 2, le))},
                             {uint16_t(rd16(meta + mp + 4, le)), uint16_t(rd16(meta + mp + 6, le))}};
+    std::memcpy(m.vpred, vpred, sizeof vpred);
     mp += 8;
     unsigned maxv = (1u << bps) & 0x7fff;
     unsigned csize = rd16(meta + mp, le); mp += 2;
@@ -85,6 +93,31 @@ bool decode_nikon_lossless(const uint8_t *strip, size_t strip_len,
         err = "unsupported NEF compression variant"; return false;
     }
     while (maxv > 2 && curve[maxv - 2] == curve[maxv - 1]) maxv--;
+    m.tree = tree;
+    m.lossy = ver0 == 0x44;
+    m.curve.assign(curve.begin(), curve.begin() + maxv);
+    m.maxv = maxv;
+    m.split = split;
+    return true;
+}
+
+// Shared decoder. want_codes: output the raw (pre-curve) codes instead of
+// linear values; the curve and the code limit are returned when requested.
+static bool decode_impl(const uint8_t *strip, size_t strip_len, const uint8_t *meta, size_t meta_len, bool le,
+                        unsigned width, unsigned height, unsigned bps, std::vector<uint16_t> &out, std::string &err,
+                        bool want_codes, std::vector<uint16_t> *curve_out, unsigned *maxv_out, unsigned *split_out) {
+    NefMeta m;
+    if (!parse_meta(meta, meta_len, le, bps, m, err)) return false;
+    const int tree = m.tree;
+    uint16_t vpred[2][2];
+    std::memcpy(vpred, m.vpred, sizeof vpred);
+    unsigned maxv = m.maxv, split = m.split;
+    std::vector<uint16_t> curve(0x10000);
+    for (unsigned i = 0; i < curve.size(); i++) curve[i] = uint16_t(i);
+    std::copy(m.curve.begin(), m.curve.end(), curve.begin());
+    if (curve_out) *curve_out = m.curve;
+    if (maxv_out) *maxv_out = maxv;
+    if (split_out) *split_out = split;
     unsigned minv = 0;
     Huff huff0(kTrees[tree]), huff1(kTrees[std::min(tree + 1, 5)]);
     const Huff *hp = &huff0;
@@ -107,10 +140,25 @@ bool decode_nikon_lossless(const uint8_t *strip, size_t strip_len,
             else hpred[col & 1] = uint16_t(hpred[col & 1] + diff);
             if (uint16_t(hpred[col & 1] + minv) >= maxv) { err = "predictor out of range"; return false; }
             int v = std::clamp<int>(int16_t(hpred[col & 1]), 0, 0x3fff);
-            dst[col] = curve[v];
+            dst[col] = want_codes ? uint16_t(v) : curve[v];
         }
         if (br.p >= br.end && br.cnt < 0) { err = "strip truncated"; return false; }
     }
+    return true;
+}
+
+bool decode_nikon_lossless(const uint8_t *strip, size_t strip_len, const uint8_t *meta, size_t meta_len, bool le,
+                           unsigned width, unsigned height, unsigned bps, std::vector<uint16_t> &out, std::string &err) {
+    return decode_impl(strip, strip_len, meta, meta_len, le, width, height, bps, out, err, false, nullptr, nullptr, nullptr);
+}
+
+bool decode_nikon_codes(const uint8_t *strip, size_t strip_len, const uint8_t *meta, size_t meta_len, bool le,
+                        unsigned width, unsigned height, unsigned bps, std::vector<uint16_t> &codes,
+                        std::vector<uint16_t> &curve, std::string &err) {
+    unsigned maxv = 0, split = 0;
+    if (!decode_impl(strip, strip_len, meta, meta_len, le, width, height, bps, codes, err, true, &curve, &maxv, &split))
+        return false;
+    if (split) { err = "split lossy NEF streams are not supported"; return false; }
     return true;
 }
 
@@ -144,14 +192,9 @@ struct BitWriter {
 };
 } // namespace
 
-bool encode_nikon_lossless(const uint16_t *px, unsigned width, unsigned height, unsigned bps,
-                           const uint8_t *meta, size_t meta_len, bool le,
-                           std::vector<uint8_t> &out, std::string &err) {
-    if (meta_len < 12 || meta[0] != 0x46) { err = "encoder needs a lossless (F0) linearization table"; return false; }
-    if (bps != 14 && bps != 12) { err = "unsupported bit depth"; return false; }
-    const unsigned maxv = 1u << bps;
-    int seeds[2][2] = {{int(rd16(meta + 2, le)), int(rd16(meta + 4, le))}, {int(rd16(meta + 6, le)), int(rd16(meta + 8, le))}};
-    HuffEnc h(kTrees[bps == 14 ? 5 : 2]);
+static bool encode_huffman(const uint16_t *px, unsigned width, unsigned height, int tree, unsigned maxv,
+                           const uint16_t seeds[2][2], std::vector<uint8_t> &out, std::string &err) {
+    HuffEnc h(kTrees[tree]);
     out.clear();
     out.reserve(size_t(width) * height * 3 / 2);
     BitWriter bw(out);
@@ -175,6 +218,34 @@ bool encode_nikon_lossless(const uint16_t *px, unsigned width, unsigned height, 
     }
     bw.flush();
     return true;
+}
+
+bool encode_nikon_lossless(const uint16_t *px, unsigned width, unsigned height, unsigned bps,
+                           const uint8_t *meta, size_t meta_len, bool le,
+                           std::vector<uint8_t> &out, std::string &err) {
+    if (meta_len < 12 || meta[0] != 0x46) { err = "encoder needs a lossless (F0) linearization table"; return false; }
+    if (bps != 14 && bps != 12) { err = "unsupported bit depth"; return false; }
+    uint16_t seeds[2][2] = {{uint16_t(rd16(meta + 2, le)), uint16_t(rd16(meta + 4, le))},
+                            {uint16_t(rd16(meta + 6, le)), uint16_t(rd16(meta + 8, le))}};
+    return encode_huffman(px, width, height, bps == 14 ? 5 : 2, 1u << bps, seeds, out, err);
+}
+
+bool nikon_lossy_curve(const uint8_t *meta, size_t meta_len, bool le, unsigned bps, std::vector<uint16_t> &curve,
+                       std::string &err) {
+    NefMeta m;
+    if (!parse_meta(meta, meta_len, le, bps, m, err)) return false;
+    if (!m.lossy) { err = "not a lossy NEF table"; return false; }
+    curve = m.curve;
+    return true;
+}
+
+bool encode_nikon_lossy(const uint16_t *codes, unsigned width, unsigned height, unsigned bps, const uint8_t *meta,
+                        size_t meta_len, bool le, std::vector<uint8_t> &out, std::string &err) {
+    NefMeta m;
+    if (!parse_meta(meta, meta_len, le, bps, m, err)) return false;
+    if (!m.lossy) { err = "encoder needs a lossy (0x44) linearization table"; return false; }
+    if (m.split) { err = "split lossy NEF streams are not supported"; return false; }
+    return encode_huffman(codes, width, height, m.tree, m.maxv, m.vpred, out, err);
 }
 
 size_t nikon_packed14_stride(unsigned width) { return (size_t(width) * 7 / 4 + 15) / 16 * 16; }

@@ -39,10 +39,13 @@ struct RestoreResult {
     bool pixels_exact = false, file_exact = false;
     unsigned previews_regenerated = 0;
     uint64_t original_size = 0;
+    bool converted_to_lossless = false;
+    const char *original_format = "";
 };
 
-// Rebuild the Nikon NEF from a DNG written by nef_to_jxl_dng.
-RestoreResult jxl_dng_to_nef(const std::vector<uint8_t> &dng, unsigned threads = 0);
+// Rebuild the Nikon NEF from a DNG written by nef_to_jxl_dng: as a lossless NEF
+// (default) or in the original NEF's format.
+RestoreResult jxl_dng_to_nef(const std::vector<uint8_t> &dng, unsigned threads = 0, bool original_format = false);
 
 // Decode the raw samples of a JPEG XL DNG (as written by nef_to_jxl_dng).
 std::vector<uint16_t> jxl_dng_decode(const std::vector<uint8_t> &dng, unsigned &W, unsigned &H, unsigned threads = 0);

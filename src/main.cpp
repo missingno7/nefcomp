@@ -26,7 +26,9 @@ static const char *kUsage =
     "usage:\n"
     "  nefcomp [options] <file.NEF | directory> ...    lossless NEF -> HE / HE* NEF; HE* -> HE (-m he)\n"
     "  nefcomp --dng [options] <file.NEF | dir> ...    NEF -> JPEG XL raw DNG (restorable)\n"
-    "  nefcomp restore [options] <file.dng | dir> ...  DNG made by --dng -> original-format NEF\n"
+    "  nefcomp restore [options] <file.dng | dir> ...  DNG made by --dng -> genuine Nikon NEF:\n"
+    "                                                  lossless NEF by default (no extra loss, editable\n"
+    "                                                  in camera); --as original = original NEF format\n"
     "  nefcomp info <file.NEF> ...\n"
     "\n"
     "options:\n"
@@ -60,7 +62,7 @@ struct Options {
     bool keep_previews = false;
     std::string output, suffix, dng_converter;
     bool verify = false, overwrite = false, allow_untested = false, suffix_set = false;
-    bool auto_mode = false, recursive = false, force = false;
+    bool auto_mode = false, recursive = false, force = false, restore_original = false;
     unsigned threads = 0;
 };
 
@@ -177,16 +179,20 @@ static size_t restore_one(const fs::path &in, const fs::path &out, const Options
     std::vector<uint8_t> d;
     auto e = read_file(in.string(), d);
     if (!e.empty()) throw std::runtime_error(e);
-    RestoreResult r = jxl_dng_to_nef(d, o.threads);
+    RestoreResult r = jxl_dng_to_nef(d, o.threads, o.restore_original);
     write_atomic(out, r.nef);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::string what;
+    if (r.file_exact) what = "byte-identical to the original NEF";
+    else {
+        what = r.converted_to_lossless ? "lossless NEF (original was " + std::string(r.original_format) + ")"
+               : std::string(r.original_format) == "lossless" ? std::string("lossless NEF")
+                                                               : "NEF in its original " + std::string(r.original_format) + " format";
+        what += r.pixels_exact ? ", raw identical to the original" : ", raw as compressed in the DNG";
+        if (r.previews_regenerated) what += ", previews regenerated";
+    }
     printf("  NEF  %s -> %s: %.1f MB (original %s %.1f MB): %s [%.1fs]\n", in.string().c_str(), out.string().c_str(),
-           r.nef.size() / 1e6, r.original_name.c_str(), r.original_size / 1e6,
-           r.file_exact ? "byte-identical to the original NEF"
-           : r.pixels_exact ? (r.previews_regenerated ? "raw data identical, previews regenerated" : "raw data identical")
-                            : (r.previews_regenerated ? "genuine NEF, raw as compressed, previews regenerated"
-                                                      : "genuine NEF, raw as compressed"),
-           secs);
+           r.nef.size() / 1e6, r.original_name.c_str(), r.original_size / 1e6, what.c_str(), secs);
     return r.nef.size();
 }
 
@@ -244,7 +250,7 @@ static void plan_nef(Job &j, const Options &o) {
     }
     const bool is_he = raw.format == RawFormat::HE || raw.format == RawFormat::HEStar;
     const bool lossless = raw.format == RawFormat::Lossless;
-    const bool to_dng_ok = lossless || raw.format == RawFormat::Packed14 || is_he;
+    const bool to_dng_ok = lossless || raw.format == RawFormat::Packed14 || raw.format == RawFormat::Lossy || is_he;
     const bool he_ok = he_verified_model(info.model) || (o.allow_untested && he_capable_model(info.model));
     // HE* -> HE is a valid step down; HE -> HE* would only grow the file
     const bool downgrade = raw.format == RawFormat::HEStar && o.mode == HeMode::HE && he_ok;
@@ -469,6 +475,12 @@ int main(int argc, char **argv) {
             else if (a == "--auto") o.auto_mode = true;
             else if (a == "-r" || a == "--recursive") o.recursive = true;
             else if (a == "--force") o.force = true;
+            else if (a == "--as") {
+                std::string v = value();
+                if (v == "lossless") o.restore_original = false;
+                else if (v == "original") o.restore_original = true;
+                else throw std::runtime_error("--as must be lossless or original");
+            }
             else if (a == "-q" || a == "--quality") o.quality = std::stod(value());
             else if (a == "--bpp") o.bpp = std::stod(value());
             else if (a == "--effort") o.effort = std::clamp(std::stoi(value()), 1, 9);

@@ -367,13 +367,34 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     auto iv = [&](uint16_t tag) { return t.ints(raw.tags.at(tag)).at(0); };
     if (iv(0x100) != W || iv(0x101) != H || iv(0x103) != 1 || iv(0x102) != 16 || iv(0x106) != 32803)
         throw std::runtime_error("unexpected raw layout in Adobe's DNG");
-    {   // Adobe's raw samples must equal nefcomp's decode
+    // Adobe's raw samples must equal nefcomp's decode. For lossy NEFs Adobe
+    // keeps the raw codes plus its curve (LinearizationTable); we take the
+    // linear values from Adobe's curve, so the DNG shows exactly what Camera
+    // Raw shows for the original NEF, and keep that curve for `restore`.
+    std::vector<uint16_t> lossy_curve;
+    {
         std::vector<uint8_t> data;
         for (auto &blk : raw.blocks.at(0x111)) data.insert(data.end(), blk.begin(), blk.end());
         if (data.size() < size_t(W) * H * 2) throw std::runtime_error("short raw data in Adobe's DNG");
-        for (size_t i = 0; i < px.size(); i++) {
-            uint16_t v = le ? uint16_t(data[2 * i] | data[2 * i + 1] << 8) : uint16_t(data[2 * i] << 8 | data[2 * i + 1]);
-            if (v != px[i]) throw std::runtime_error("Adobe's raw data differs from nefcomp's decode");
+        auto sample = [&](size_t i) {
+            return le ? uint16_t(data[2 * i] | data[2 * i + 1] << 8) : uint16_t(data[2 * i] << 8 | data[2 * i + 1]);
+        };
+        if (info.format == RawFormat::Lossy) {
+            std::vector<uint16_t> codes, nikon_curve;
+            decode_raw_codes(nef, codes, nikon_curve);
+            if (!raw.tags.count(0xc618)) throw std::runtime_error("Adobe's DNG of a lossy NEF has no linearization table");
+            std::vector<uint16_t> adobe;
+            for (uint32_t v : t.ints(raw.tags[0xc618])) adobe.push_back(uint16_t(v));
+            if (adobe.size() < nikon_curve.size()) throw std::runtime_error("Adobe's linearization table is too short");
+            for (size_t i = 0; i < px.size(); i++) {
+                if (sample(i) != codes[i]) throw std::runtime_error("Adobe's raw codes differ from nefcomp's decode");
+                px[i] = std::min<uint16_t>(adobe[codes[i]], 16383);
+            }
+            lossy_curve.assign(adobe.begin(), adobe.begin() + nikon_curve.size());
+            for (auto &v : lossy_curve) v = std::min<uint16_t>(v, 16383);
+        } else {
+            for (size_t i = 0; i < px.size(); i++)
+                if (sample(i) != px[i]) throw std::runtime_error("Adobe's raw data differs from nefcomp's decode");
         }
     }
 
@@ -483,7 +504,7 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     // 5. the rest of the NEF
     std::vector<uint8_t> mn = ifd0.tags.count(0xc634) ? dng_private_makernote(ifd0.tags[0xc634].data) : std::vector<uint8_t>{};
     EmbedStats es;
-    auto blob = embed_build(nef, px, mn, o.keep_previews, &es);
+    auto blob = embed_build(nef, px, mn, o.keep_previews, &es, lossy_curve.empty() ? nullptr : &lossy_curve);
     res.skeleton_bytes = blob.size();
     res.previews_dropped = es.previews_dropped;
     res.previews_kept_bytes = es.previews_kept;
@@ -495,7 +516,7 @@ DngResult nef_to_jxl_dng(const std::string &nef_path, const DngOptions &o) {
     return res;
 }
 
-RestoreResult jxl_dng_to_nef(const std::vector<uint8_t> &dng, unsigned threads) {
+RestoreResult jxl_dng_to_nef(const std::vector<uint8_t> &dng, unsigned threads, bool original_format) {
     RestoreResult rr;
     Buf b;
     b.d = dng;
@@ -516,7 +537,9 @@ RestoreResult jxl_dng_to_nef(const std::vector<uint8_t> &dng, unsigned threads) 
     RenderParams rp = render_params(t, ifd0, raw);
     rp.threads = threads;
     EmbedRestore ei;
-    rr.nef = embed_restore(ifd0.tags[kSkelTag].data, px, mn, rp, &ei);
+    rr.nef = embed_restore(ifd0.tags[kSkelTag].data, px, mn, rp, &ei, !original_format);
+    rr.converted_to_lossless = ei.converted_to_lossless;
+    rr.original_format = ei.original_format;
     rr.pixels_exact = ei.pixels_exact;
     rr.file_exact = ei.file_exact;
     rr.previews_regenerated = ei.previews_regenerated;

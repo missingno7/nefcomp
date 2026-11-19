@@ -41,4 +41,9 @@ struct ConvertResult {
 ConvertResult convert_lossless_to_he(const std::vector<uint8_t> &file, const HeEncodeOptions &opt,
                                      bool allow_untested_model);
 
+// Turn a NEF skeleton (bytes before the raw strip) of any supported format
+// (HE, HE*, lossy, uncompressed) into a lossless-NEF skeleton, with metadata
+// as the camera writes it for lossless files. The raw strip offset is updated.
+std::vector<uint8_t> skeleton_to_lossless(const std::vector<uint8_t> &skeleton);
+
 } // namespace nefcomp
